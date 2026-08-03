@@ -1,17 +1,57 @@
 import { join } from "node:path";
-import {
-	FileAuthStorageBackend,
-	getAgentDir,
-	type AuthStorageBackend,
-	type ExtensionAPI,
-	type ExtensionCommandContext,
-	type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import * as piCore from "@earendil-works/pi-coding-agent";
 import {
 	openaiCodexOAuthProvider,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 } from "@earendil-works/pi-ai/oauth";
+
+// Re-export symbols we need from pi core (types stay, runtime may be missing).
+const getAgentDir = piCore.getAgentDir;
+type ExtensionAPI = piCore.ExtensionAPI;
+type ExtensionCommandContext = piCore.ExtensionCommandContext;
+type ExtensionContext = piCore.ExtensionContext;
+
+// AuthStorageBackend interface shape (methods used by CodexAccountStore).
+interface LockResult<T> { result: T; next?: string }
+interface AuthStorageBackend {
+	withLock<T>(mutator: (current: string | undefined) => LockResult<T>): T;
+	withLockAsync<T>(mutator: (current: string | undefined) => Promise<LockResult<T>>): Promise<T>;
+}
+
+// Shim for pi versions where FileAuthStorageBackend was removed (>=0.17 era).
+// Plain fs read/write, no cross-process lock. Single-process pi = safe enough.
+// Files are mode 0600, dir 0700, matching upstream behavior.
+class ShimFileAuthStorageBackend implements AuthStorageBackend {
+	constructor(private readonly filePath: string) {}
+
+	private readCurrent(): string | undefined {
+		try { return readFileSync(this.filePath, "utf8"); } catch { return undefined; }
+	}
+
+	private writeNext(next: string): void {
+		mkdirSync(join(this.filePath, ".."), { recursive: true, mode: 0o700 });
+		writeFileSync(this.filePath, next, { encoding: "utf8", mode: 0o600 });
+	}
+
+	withLock<T>(mutator: (current: string | undefined) => LockResult<T>): T {
+		const out = mutator(this.readCurrent());
+		if (out.next !== undefined) this.writeNext(out.next);
+		return out.result;
+	}
+
+	async withLockAsync<T>(mutator: (current: string | undefined) => Promise<LockResult<T>>): Promise<T> {
+		const out = await mutator(this.readCurrent());
+		if (out.next !== undefined) this.writeNext(out.next);
+		return out.result;
+	}
+}
+
+// Use real FileAuthStorageBackend if present (older pi), else shim.
+const FileAuthStorageBackend: { new (path: string): AuthStorageBackend } =
+	(piCore as { FileAuthStorageBackend?: { new (path: string): AuthStorageBackend } }).FileAuthStorageBackend
+		?? ShimFileAuthStorageBackend;
 
 export const CODEX_PROVIDER_ID = "openai-codex";
 export const DEFAULT_CODEX_MODEL_ID = "gpt-5.5";
