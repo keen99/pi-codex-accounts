@@ -264,10 +264,6 @@ export default function codexAccounts(
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (!deprecationWarningShown) {
-			ctx.ui.notify(DEPRECATION_WARNING_MESSAGE, "warning");
-			deprecationWarningShown = true;
-		}
 		if (migrationNotice) {
 			ctx.ui.notify(migrationNotice, "warning");
 			migrationNotice = undefined;
