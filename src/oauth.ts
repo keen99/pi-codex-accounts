@@ -15,40 +15,10 @@ export type CodexOAuthPrompt = Parameters<OAuthLoginCallbacks["onPrompt"]>[0] & 
 export type CodexOAuthSelectPrompt = Parameters<OAuthLoginCallbacks["onSelect"]>[0] & {
 	signal?: AbortSignal;
 };
-interface ProviderOwnedOAuthPrompt {
-	message: string;
-	options?: ReadonlyArray<{ id: string; label: string }>;
-	placeholder?: string;
-	signal?: AbortSignal;
-	type: string;
-}
-
-type ProviderOwnedOAuthNotification =
-	| { type: "info"; message: string; links?: ReadonlyArray<{ url: string }> }
-	| { type: "auth_url"; url: string; instructions?: string }
-	| ({ type: "device_code" } & DeviceCodeInfo)
-	| { type: "progress"; message: string };
-
-type OAuthCredential = OAuthCredentials & { type: "oauth" };
-
-interface ProviderOwnedOAuth {
-	login(options: {
-		signal?: AbortSignal;
-		prompt(prompt: ProviderOwnedOAuthPrompt): Promise<string>;
-		notify(event: ProviderOwnedOAuthNotification): void;
-	}): Promise<OAuthCredentials>;
-	refresh(credentials: OAuthCredential): Promise<OAuthCredentials>;
-	toAuth(credentials: OAuthCredential): Promise<{ apiKey?: string }>;
-}
-
-interface BuiltinProviderModule {
-	builtinProviders(): ReadonlyArray<{
-		id: string;
-		auth: { oauth?: ProviderOwnedOAuth };
-	}>;
-}
-
-const PROVIDERS_MODULE_ID = "@earendil-works/pi-ai/providers/all";
+type BuiltinProvider = ReturnType<
+	typeof import("@earendil-works/pi-ai/providers/all").builtinProviders
+>[number];
+type ProviderOwnedOAuth = NonNullable<BuiltinProvider["auth"]["oauth"]>;
 
 export type CodexOAuthCallbacks = Omit<
 	OAuthLoginCallbacks,
@@ -89,7 +59,7 @@ function createProviderOwnedCodexOAuthAdapter(providerId: string): CodexOAuthPro
 					if (prompt.type === "select") {
 						const selected = await callbacks.onSelect({
 							message: prompt.message,
-							options: (prompt.options ?? []).map(({ id, label }) => ({ id, label })),
+							options: prompt.options.map(({ id, label }) => ({ id, label })),
 							signal: prompt.signal,
 						});
 						if (selected === undefined) throw new Error("Login cancelled");
@@ -144,12 +114,13 @@ function createProviderOwnedCodexOAuthAdapter(providerId: string): CodexOAuthPro
 }
 
 function loadProviderOwnedCodexOAuth(providerId: string): Promise<ProviderOwnedOAuth> {
-	providerOwnedOAuthPromise ??= import(PROVIDERS_MODULE_ID).then((module: unknown) => {
-		const { builtinProviders } = module as BuiltinProviderModule;
-		const oauth = builtinProviders().find((provider) => provider.id === providerId)?.auth.oauth;
-		if (!oauth) throw new Error("Pi's built-in OpenAI Codex OAuth provider is unavailable.");
-		return oauth;
-	});
+	providerOwnedOAuthPromise ??= import("@earendil-works/pi-ai/providers/all").then(
+		({ builtinProviders }) => {
+			const oauth = builtinProviders().find((provider) => provider.id === providerId)?.auth.oauth;
+			if (!oauth) throw new Error("Pi's built-in OpenAI Codex OAuth provider is unavailable.");
+			return oauth;
+		},
+	);
 	return providerOwnedOAuthPromise;
 }
 
