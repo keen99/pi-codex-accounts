@@ -3,42 +3,41 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
 > [!IMPORTANT]
-> **Fork of `@narumitw/pi-codex-accounts` (v0.24.0).** Upstream deprecated this package in
-> [`narumiruna/pi-extensions`](https://github.com/narumiruna/pi-extensions) (moved to
-> `deprecated/`) in favor of [`@narumitw/pi-accounts`](https://github.com/narumiruna/pi-extensions/tree/main/extensions/pi-accounts),
-> a single-active-account multi-provider replacement.
+> **Fork of `@narumitw/pi-codex-accounts` (v0.11.0).** Pinned to the pre-deprecation
+> version that predates upstream's storage rename and migration logic.
 >
-> This fork **preserves the original behavior** that `pi-accounts` dropped:
-> - `accountId` field on stored credentials (used for `ChatGPT-Account-Id` header + cache keys)
-> - Flat `codex-accounts.json` storage format (not the nested `pi-accounts.json` shape)
-> - `/codex-login`, `/codex-account`, `/codex-logout` commands
+> **Why this version:**
+> - Uses `codex-accounts.json` directly (no `pi-codex-accounts.json` rename)
+> - No migration/legacy/precedence logic (no stub regeneration, no warnings)
+> - Keeps `accountId` field (used for `ChatGPT-Account-Id` header + cache keys)
+> - Keeps `/codex-login`, `/codex-account`, `/codex-logout` commands
 >
-> **Reason for fork:** downstream extension `pi-usage-status` relies on `accountId` and the
-> flat format to enumerate and report usage across multiple stored accounts. `pi-accounts`
-> (and its companion `pi-usage`) are single-active-account only and no longer capture
-> `accountId`. This fork keeps the multi-account workflow working.
+> Upstream `0.16.0+` renamed the file to `pi-codex-accounts.json` and added migration
+> code that leaves an empty `{}` stub of the old filename and warns every session.
+> Later versions (`0.24.0`) deprecated the package entirely in favor of
+> [`@narumitw/pi-accounts`](https://github.com/narumiruna/pi-extensions/tree/main/extensions/pi-accounts),
+> a single-active-account multi-provider replacement that drops `accountId`.
 >
-> Code is byte-identical to npm `@narumitw/pi-codex-accounts@0.24.0`; only this README and
-> the `repository` field in `package.json` were changed. Package name is unchanged so existing
-> imports keep working.
+> `pi-usage-status` (downstream) reads `codex-accounts.json` directly and relies on
+> `accountId` to enumerate usage across multiple stored accounts. This fork keeps
+> that workflow intact by staying on the 0.11.0 codebase.
 >
 > **Upstream:** [`narumiruna/pi-extensions` → `deprecated/pi-codex-accounts`](https://github.com/narumiruna/pi-extensions/tree/main/deprecated/pi-codex-accounts)
 > ([MIT](./LICENSE), © narumiruna)
 
 ---
 
+## ✨ Features
 
 - Adds `/codex-login <name>` for storing a named ChatGPT Codex subscription account.
 - Adds `/codex-account [name]` for switching the active self-managed Codex account.
 - Adds `/codex-logout <name>` for deleting one self-managed account.
 - Adds `(default pi login)` in the selector to clear the active self-managed account and return to Pi's normal `openai-codex` auth.
-- Stores credentials in `~/.pi/agent/pi-codex-accounts.json` with private file permissions.
-- Sets a runtime API key on Pi's native `openai-codex` provider and verifies that Pi can resolve it before reporting activation success.
-- Temporarily installs the native-provider API-key bridge required by Pi's OAuth-only Codex provider, then removes it when self-managed auth becomes inactive.
+- Stores credentials in `~/.pi/agent/codex-accounts.json` with private file permissions.
+- Sets only the runtime API key for Pi's native `openai-codex` provider.
 - Leaves your selected `/model` unchanged, matching Pi's built-in `/login` behavior, except it may select `openai-codex/gpt-5.5` when the current model is `unknown/unknown`.
 - Shows `codex:<name>` in the statusline only while the current model provider is `openai-codex`.
-- Fails closed if an active self-managed account cannot refresh or produce a runtime key, so Pi does not silently fall back to a different Codex account.
-- Closes the current session's cached Codex WebSocket when auth changes, preventing a reused connection from staying on the previous account.
+- Fails closed if an active self-managed account cannot refresh, so Pi does not silently fall back to a different Codex account.
 
 ## 📦 Install
 
@@ -60,7 +59,7 @@ pi -e ./extensions/pi-codex-accounts
 
 ## 🚀 Usage
 
-Login to named accounts (`default` is reserved for Pi's built-in login):
+Login to named accounts:
 
 ```text
 /codex-login work
@@ -88,34 +87,26 @@ Remove one self-managed account:
 
 ## 🔐 Auth behavior
 
-The canonical credential file is `~/.pi/agent/pi-codex-accounts.json`. A legacy-only `codex-accounts.json` is migrated under the existing credential-file lock, copied with `0600` permissions, and removed only after the canonical file is installed. If both files exist, the canonical file takes precedence and the legacy file is retained.
+When an active self-managed account is set, the extension applies that account's access token as Pi's runtime key for the native `openai-codex` provider.
 
-When an active self-managed account is set, the extension temporarily overlays Pi's native `openai-codex` provider with an API-key resolver, applies the account's access token as a runtime key, and verifies the resolved key before reporting success. This bridge is necessary because Pi 0.80.8's native Codex provider is OAuth-only: recording an `api_key` runtime credential without an API-key resolver leaves the provider unavailable. Login and refresh still use Pi's built-in Codex OAuth implementation through the loader entry point supported by the running Pi version. Runtime key application supports both Pi 0.80.3's auth-storage shape and Pi 0.80.8's model-runtime shape.
+When no self-managed account is active, the extension removes its runtime override and Pi uses its normal `openai-codex` auth resolution. That means existing `/login openai-codex`, `auth.json`, or environment behavior still works.
 
-When no self-managed account is active, the extension removes its runtime override and native-provider overlay, and Pi uses its normal `openai-codex` auth resolution. That means existing `/login openai-codex`, `auth.json`, or environment behavior still works. Return to `/codex-account default` before using Pi's built-in `/login` or `/logout` flow.
-
-If the active self-managed account cannot refresh or produce an API key, the extension keeps a non-empty failing runtime key in place. This prevents accidental fallback to a different Codex account.
-
-Account switches and token refreshes also close any cached Codex WebSocket for the current Pi session. The next request reconnects with the newly selected credentials; repeated pre-turn checks, including turns started after compaction, keep the connection when auth is unchanged.
+If the active self-managed account refresh fails, the extension keeps a non-empty failing runtime key in place. This prevents accidental fallback to a different Codex account.
 
 ## 🚧 Limitations
 
 - This extension supports ChatGPT Plus/Pro Codex subscription auth only.
 - It does not rotate accounts automatically or try to bypass rate limits.
 - It does not switch Claude, Anthropic, or browser-cookie sessions.
-- Multiple Pi processes refreshing the same account at the same time are serialized through the extension's credential-file lock, but the newest refreshed token wins.
+- Multiple Pi processes refreshing the same account at the same time are serialized through Pi's auth-file lock helper, but the newest refreshed token wins.
 
 ## 🗂️ Package layout
 
 ```txt
 extensions/pi-codex-accounts/
 ├── src/
-│   ├── codex-accounts.ts
-│   ├── oauth.ts
-│   ├── runtime-auth.ts
-│   └── storage.ts
+│   └── codex-accounts.ts
 ├── test/
-│   ├── codex-accounts-storage.test.ts
 │   └── codex-accounts.test.ts
 ├── README.md
 ├── LICENSE
