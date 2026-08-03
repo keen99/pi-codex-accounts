@@ -504,9 +504,26 @@ function defaultAccountsPath(): string {
 		if (permissionError) notices.push(permissionError);
 		if (readableFileExists(canonicalPath)) {
 			if (pathEntryExists(legacyPath)) {
-				notices.push(
-					`${LEGACY_CODEX_ACCOUNTS_FILE} ignored because ${CODEX_ACCOUNTS_FILE} takes precedence.`,
-				);
+				// Fork: empty legacy stub ({}) + canonical has data = stale leftover,
+				// not a real migration source. Delete silent, no warn. Upstream
+				// warns every session because migration never removes an empty legacy.
+				try {
+					const legacyRaw = readFileSync(legacyPath, "utf8").trim();
+					const canonicalRaw = readFileSync(canonicalPath, "utf8").trim();
+					const legacyEmpty = legacyRaw === "{}" || legacyRaw === "";
+					const canonicalHasData = canonicalRaw !== "{}" && canonicalRaw !== "";
+					if (legacyEmpty && canonicalHasData) {
+						rmSync(legacyPath);
+					} else {
+						notices.push(
+							`${LEGACY_CODEX_ACCOUNTS_FILE} ignored because ${CODEX_ACCOUNTS_FILE} takes precedence.`,
+						);
+					}
+				} catch {
+					notices.push(
+						`${LEGACY_CODEX_ACCOUNTS_FILE} ignored because ${CODEX_ACCOUNTS_FILE} takes precedence.`,
+					);
+				}
 			}
 			pendingAccountsMigrationNotice = notices.length > 0 ? notices.join("\n") : undefined;
 			return canonicalPath;
