@@ -37,6 +37,7 @@ export const DEFAULT_PI_LOGIN_LABEL = "(default pi login)";
 export const FAIL_CLOSED_API_KEY = "pi-codex-accounts-refresh-failed";
 
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
+const BACKGROUND_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 const MIGRATION_LOCK_TIMEOUT_MS = 30_000;
 const ACCOUNT_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -152,6 +153,30 @@ export default function codexAccounts(
 	const closeWebSocketSessions = dependencies.closeWebSocketSessions ?? (() => undefined);
 	let appliedAuthIdentity: string | undefined;
 	let authIdentityInitialized = false;
+	let backgroundRefreshNotifiedFailures = new Set<string>();
+	let lastBackgroundRefreshCheckMs = 0;
+
+	const backgroundRefresh = async (ctx: ExtensionContext) => {
+		let errors: Map<string, string>;
+		try {
+			errors = await refreshStoredAccounts(store, { oauthProvider });
+		} catch (error) {
+			ctx.ui.notify(
+				`Codex background account refresh failed: ${redactTokenText(errorMessage(error))}`,
+				"warning",
+			);
+			return;
+		}
+		for (const [name, message] of errors) {
+			if (backgroundRefreshNotifiedFailures.has(name)) continue;
+			backgroundRefreshNotifiedFailures.add(name);
+			ctx.ui.notify(
+				`Codex account "${name}" token refresh failed: ${message}. Re-login with /codex-login ${name} when convenient.`,
+				"warning",
+			);
+		}
+		if (errors.size === 0) backgroundRefreshNotifiedFailures = new Set();
+	};
 
 	const sync = async (ctx: ExtensionContext, model = ctx.model) => {
 		const result = await ensureActiveCodexAuth(ctx, store, { oauthProvider });
@@ -256,6 +281,9 @@ export default function codexAccounts(
 
 	pi.on("session_start", async (_event, ctx) => {
 		await sync(ctx);
+		backgroundRefreshNotifiedFailures = new Set();
+		lastBackgroundRefreshCheckMs = Date.now();
+		await backgroundRefresh(ctx);
 	});
 
 	pi.on("model_select", async (event, ctx) => {
@@ -264,6 +292,10 @@ export default function codexAccounts(
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		await sync(ctx);
+		const now = Date.now();
+		if (now - lastBackgroundRefreshCheckMs < BACKGROUND_REFRESH_INTERVAL_MS) return;
+		lastBackgroundRefreshCheckMs = now;
+		await backgroundRefresh(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -285,6 +317,41 @@ export function parseAccountName(
 		};
 	}
 	return { ok: true, name };
+}
+
+/**
+ * Refreshes every stored account whose access token is expired (or within the refresh
+ * skew window), not just the active one. Runs each refresh inside the store lock so a
+ * concurrent Pi session or the active-account sync cannot double-refresh the same
+ * credential (OpenAI rotates refresh tokens, so a second refresh with the old token
+ * would fail). Failures never throw; they are returned per account so callers can
+ * surface them without blocking startup.
+ */
+export async function refreshStoredAccounts(
+	store: CodexAccountStore,
+	options: { oauthProvider?: RefreshOnlyCodexOAuthProvider; now?: number } = {},
+): Promise<Map<string, string>> {
+	const oauthProvider = options.oauthProvider ?? getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
+	const now = options.now ?? Date.now();
+	const errors = new Map<string, string>();
+	const data = await store.readAsync();
+	for (const [name, credential] of Object.entries(data.accounts)) {
+		if (credential.expires > now + REFRESH_SKEW_MS) continue;
+		await store.updateAsync(async (latest) => {
+			const latestCredential = latest.accounts[name];
+			if (!latestCredential || latestCredential.expires > Date.now() + REFRESH_SKEW_MS) {
+				return latest;
+			}
+			try {
+				const refreshed = normalizeCredential(await oauthProvider.refreshToken(latestCredential));
+				return { ...latest, accounts: { ...latest.accounts, [name]: refreshed } };
+			} catch (error) {
+				errors.set(name, redactCredentialError(error, latestCredential));
+				return latest;
+			}
+		});
+	}
+	return errors;
 }
 
 export async function ensureActiveCodexAuth(
