@@ -28,6 +28,8 @@ import {
 	type RefreshOnlyCodexOAuthProvider,
 } from "./oauth.js";
 import { type CodexAccountStorageBackend, FileCodexAccountStorageBackend } from "./storage.js";
+import { loadAutoSwitchConfig, type AutoSwitchConfig } from "./config.js";
+import { SwitchStateStore } from "./switch-state.js";
 
 export const CODEX_PROVIDER_ID = "openai-codex";
 export const DEFAULT_CODEX_MODEL_ID = "gpt-5.5";
@@ -88,6 +90,8 @@ export type CodexAccountsDependencies = {
 	store?: CodexAccountStore;
 	oauthProvider?: CodexOAuthProvider;
 	closeWebSocketSessions?: (sessionId?: string) => unknown;
+	switchStateStore?: SwitchStateStore;
+	loadSwitchConfig?: () => AutoSwitchConfig;
 };
 
 export class CodexAccountStore {
@@ -155,6 +159,61 @@ export default function codexAccounts(
 	let authIdentityInitialized = false;
 	let backgroundRefreshNotifiedFailures = new Set<string>();
 	let lastBackgroundRefreshCheckMs = 0;
+	const switchStateStore = dependencies.switchStateStore ?? new SwitchStateStore();
+	const loadSwitchConfig = dependencies.loadSwitchConfig ?? loadAutoSwitchConfig;
+	let lastAutoSwitchMs = 0;
+	let autoSwitchBusy = false;
+
+	const attemptAutoSwitch = async (ctx: ExtensionContext): Promise<void> => {
+		if (autoSwitchBusy) return;
+		const config = loadSwitchConfig();
+		if (!config.autoSwitch) return;
+		if (!isOpenAICodexModel(ctx.model)) return;
+		autoSwitchBusy = true;
+		try {
+			const data = await store.readAsync();
+			const active = data.active;
+			if (!active || !getOwnStoredAccount(data.accounts, active)) return;
+			const now = Date.now();
+			if (now - lastAutoSwitchMs < config.minSwitchIntervalMs) return;
+			const exhausted = await switchStateStore.read();
+			if ((exhausted[active] ?? 0) <= now) {
+				await switchStateStore.markExhausted(active, now + config.cooldownMs, now);
+			}
+			const fresh = await switchStateStore.read();
+			const candidates = Object.keys(data.accounts)
+				.filter((name) => name !== active)
+				.filter((name) => (fresh[name] ?? 0) <= now)
+				.sort();
+			if (candidates.length === 0) {
+				ctx.ui.notify(
+					`Codex account "${active}" hit usage limit and no other account is available. Staying on "${active}".`,
+					"warning",
+				);
+				return;
+			}
+			const next = candidates[0];
+			lastAutoSwitchMs = now;
+			await store.update((latest) => {
+				if (latest.active !== active) return latest;
+				return { ...latest, active: next };
+			});
+			const result = await sync(ctx);
+			ctx.ui.notify(
+				result.status === "active" && result.accountName === next
+					? `Codex account "${active}" exhausted (usage limit). Auto-switched to "${next}".`
+					: `Codex auto-switch to "${next}" did not activate cleanly.`,
+				result.status === "active" ? "info" : "warning",
+			);
+		} catch (error) {
+			ctx.ui.notify(
+				`Codex auto-switch failed: ${redactTokenText(errorMessage(error))}`,
+				"warning",
+			);
+		} finally {
+			autoSwitchBusy = false;
+		}
+	};
 
 	const backgroundRefresh = async (ctx: ExtensionContext) => {
 		let errors: Map<string, string>;
@@ -296,6 +355,11 @@ export default function codexAccounts(
 		if (now - lastBackgroundRefreshCheckMs < BACKGROUND_REFRESH_INTERVAL_MS) return;
 		lastBackgroundRefreshCheckMs = now;
 		await backgroundRefresh(ctx);
+	});
+
+	pi.on("after_provider_response", async (event, ctx) => {
+		if (event.status !== 429) return;
+		await attemptAutoSwitch(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {

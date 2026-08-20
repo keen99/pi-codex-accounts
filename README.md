@@ -85,6 +85,30 @@ Remove one self-managed account:
 /codex-logout work
 ```
 
+## 🔁 Auto-switch on usage exhaustion (optional, default off)
+
+When enabled, a 429 (usage limit) response while a self-managed account is active
+switches to the next stored account that is not itself in a cooldown window.
+
+Config lives in `~/.pi/agent/codex-accounts-config.json`:
+
+```json
+{
+  "autoSwitch": true,
+  "cooldownMs": 1800000,
+  "minSwitchIntervalMs": 300000
+}
+```
+
+- `autoSwitch` — master toggle. Absent/false = feature fully off (default).
+- `cooldownMs` — how long a 429'd account is skipped (default 30 min, clamp 1 min–24 h).
+- `minSwitchIntervalMs` — anti-thrash minimum time between auto-switches (default 5 min, clamp 0–24 h).
+
+Cooldown state persists in `~/.pi/agent/codex-accounts-switch-state.json` across sessions.
+Switching only happens among self-managed accounts; the default Pi login is never
+auto-selected. A 429 marks the active account exhausted and switches — the current
+request still fails once; the next turn runs on the new account.
+
 ## 🔐 Auth behavior
 
 When an active self-managed account is set, the extension applies that account's access token as Pi's runtime key for the native `openai-codex` provider.
@@ -96,7 +120,7 @@ If the active self-managed account refresh fails, the extension keeps a non-empt
 ## 🚧 Limitations
 
 - This extension supports ChatGPT Plus/Pro Codex subscription auth only.
-- It does not rotate accounts automatically or try to bypass rate limits.
+- It does not bypass rate limits; optional auto-switch (see above) only picks a different stored account on 429.
 - It does not switch Claude, Anthropic, or browser-cookie sessions.
 - Multiple Pi processes refreshing the same account at the same time are serialized through Pi's auth-file lock helper, but the newest refreshed token wins.
 
