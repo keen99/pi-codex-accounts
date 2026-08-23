@@ -5,6 +5,9 @@
 	"type": "module",
 	"license": "MIT",
 	"private": false,
+	"dependencies": {
+		"proper-lockfile": "^4.1.2"
+	},
 	"keywords": [
 		"pi-package",
 		"pi-extension",
