@@ -255,6 +255,7 @@ export default function codexAccounts(
 					formatActivatedMessage("Logged in", parsedName.name, result),
 					"info",
 				);
+				notifyUsageStatusRefresh();
 			} catch (error) {
 				ctx.ui.notify(
 					`Codex login failed: ${redactTokenText(errorMessage(error))}`,
@@ -323,6 +324,7 @@ export default function codexAccounts(
 
 			if (removedActive) await sync(ctx);
 			ctx.ui.notify(`Removed Codex account "${parsedName.name}".`, "info");
+			notifyUsageStatusRefresh();
 		},
 	});
 
@@ -877,6 +879,7 @@ async function activateStoredAccount(
 		formatActivatedMessage("Activated", name, result),
 		result.status === "error" ? "error" : "info",
 	);
+	notifyUsageStatusRefresh();
 }
 
 async function clearActiveAccount(
@@ -887,6 +890,18 @@ async function clearActiveAccount(
 	await store.update((data) => ({ ...data, active: undefined }));
 	await sync(ctx);
 	ctx.ui.notify("Using default Pi Codex login.", "info");
+	notifyUsageStatusRefresh();
+}
+
+/**
+ * Cross-extension handshake: pi fires no event when /codex-account switches an
+ * account, so pi-usage-status exposes globalThis.__piUsageStatusRefresh and we
+ * call it after any auth change so the usage footer updates immediately.
+ * Guarded: no-op when pi-usage-status is not installed.
+ */
+function notifyUsageStatusRefresh(): void {
+	const hook = (globalThis as Record<string, unknown>).__piUsageStatusRefresh;
+	if (typeof hook === "function") (hook as () => void)();
 }
 
 function isDefaultPiLoginArg(arg: string): boolean {
