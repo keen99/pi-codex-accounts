@@ -1,4 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 type RuntimeAuthStorage = {
 	setRuntimeApiKey(provider: string, apiKey: string): void | Promise<void>;
@@ -28,7 +31,9 @@ export class RuntimeApiKeyBridge {
 	private readonly fallbackApiKey: string;
 	private registered = false;
 	private operationGeneration = 0;
-	private previousProviderApiKey: { present: boolean; value?: string } | undefined;
+	private previousProviderApiKey:
+		| { present: boolean; value?: string }
+		| undefined;
 
 	constructor(pi: ExtensionAPI, providerId: string, fallbackApiKey: string) {
 		this.pi = pi;
@@ -42,17 +47,22 @@ export class RuntimeApiKeyBridge {
 	}
 
 	prepare(ctx: ExtensionContext, operationGeneration: number): void {
-		if (operationGeneration !== this.operationGeneration || this.registered) return;
+		if (operationGeneration !== this.operationGeneration || this.registered)
+			return;
 		const current = this.getRegisteredProviderConfig(ctx);
 		this.previousProviderApiKey = current
 			? { present: Object.hasOwn(current, "apiKey"), value: current.apiKey }
 			: { present: false };
-		this.pi.registerProvider(this.providerId, { ...current, apiKey: this.fallbackApiKey });
+		this.pi.registerProvider(this.providerId, {
+			...current,
+			apiKey: this.fallbackApiKey,
+		});
 		this.registered = true;
 	}
 
 	remove(ctx: ExtensionContext, operationGeneration: number): void {
-		if (operationGeneration !== this.operationGeneration || !this.registered) return;
+		if (operationGeneration !== this.operationGeneration || !this.registered)
+			return;
 		const current = this.getRegisteredProviderConfig(ctx);
 		if (current && current.apiKey !== this.fallbackApiKey) {
 			this.reset();
@@ -72,9 +82,13 @@ export class RuntimeApiKeyBridge {
 		this.reset();
 	}
 
-	private getRegisteredProviderConfig(ctx: ExtensionContext): RuntimeProviderConfig | undefined {
+	private getRegisteredProviderConfig(
+		ctx: ExtensionContext,
+	): RuntimeProviderConfig | undefined {
 		const registry = ctx.modelRegistry as unknown as {
-			getRegisteredProviderConfig?: (provider: string) => RuntimeProviderConfig | undefined;
+			getRegisteredProviderConfig?: (
+				provider: string,
+			) => RuntimeProviderConfig | undefined;
 			registeredProviders?: Map<string, RuntimeProviderConfig>;
 		};
 		if (typeof registry.getRegisteredProviderConfig === "function") {
@@ -116,7 +130,9 @@ export class RuntimeApiKeyController {
 		const matches = await this.matches(ctx, apiKey);
 		if (matches !== false) return "applied";
 		if (!(await this.set(snapshot, apiKey, true))) return "stale";
-		return (await this.matches(ctx, apiKey)) === false ? "unavailable" : "applied";
+		return (await this.matches(ctx, apiKey)) === false
+			? "unavailable"
+			: "applied";
 	}
 
 	invalidate(ctx: ExtensionContext): void {
@@ -149,7 +165,10 @@ export class RuntimeApiKeyController {
 		};
 		if (typeof registry.getApiKeyForProvider !== "function") return undefined;
 		try {
-			return (await registry.getApiKeyForProvider(this.providerId)) === expectedApiKey;
+			return (
+				(await registry.getApiKeyForProvider(this.providerId)) ===
+				expectedApiKey
+			);
 		} catch {
 			return false;
 		}
@@ -161,7 +180,9 @@ export class RuntimeApiKeyController {
 		force = false,
 	): Promise<boolean> {
 		if (!snapshot) {
-			throw new Error("This Pi version does not expose runtime provider authentication.");
+			throw new Error(
+				"This Pi version does not expose runtime provider authentication.",
+			);
 		}
 		const { generation, state, target } = snapshot;
 		return enqueueMutation(state, async () => {
@@ -189,7 +210,10 @@ export class RuntimeApiKeyController {
 	}
 }
 
-function enqueueMutation<T>(state: RuntimeOverrideState, mutate: () => Promise<T>): Promise<T> {
+function enqueueMutation<T>(
+	state: RuntimeOverrideState,
+	mutate: () => Promise<T>,
+): Promise<T> {
 	const operation = state.operationTail.then(mutate);
 	state.operationTail = operation.then(
 		() => undefined,
@@ -198,7 +222,9 @@ function enqueueMutation<T>(state: RuntimeOverrideState, mutate: () => Promise<T
 	return operation;
 }
 
-function getRuntimeAuthStorage(ctx: ExtensionContext): (RuntimeAuthStorage & object) | undefined {
+function getRuntimeAuthStorage(
+	ctx: ExtensionContext,
+): (RuntimeAuthStorage & object) | undefined {
 	const registry = ctx.modelRegistry as unknown as {
 		authStorage?: unknown;
 		runtime?: unknown;
@@ -209,7 +235,9 @@ function getRuntimeAuthStorage(ctx: ExtensionContext): (RuntimeAuthStorage & obj
 	return undefined;
 }
 
-function isRuntimeAuthStorage(value: unknown): value is RuntimeAuthStorage & object {
+function isRuntimeAuthStorage(
+	value: unknown,
+): value is RuntimeAuthStorage & object {
 	return (
 		!!value &&
 		typeof value === "object" &&

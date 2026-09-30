@@ -1,11 +1,15 @@
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import lockfile from "proper-lockfile";
 
 const PRIVATE_FILE_WRITE_OPTIONS = { encoding: "utf8", mode: 0o600 } as const;
-const DEFAULT_SYNC_LOCK_TIMEOUT_MS = 200;
-const SYNC_LOCK_RETRY_INTERVAL_MS = 20;
-const syncSleepState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 type StorageLockResult<T> = {
 	result: T;
@@ -13,29 +17,22 @@ type StorageLockResult<T> = {
 };
 
 export interface CodexAccountStorageBackend {
-	withLock<T>(mutator: (current: string | undefined) => StorageLockResult<T>): T;
+	/** Lockless read of the raw file contents. Safe: never creates or removes lock entries. */
+	readRaw(): string | undefined;
+	/** Locked read-modify-write. The lock exists only for the duration of a real write. */
 	withLockAsync<T>(
 		mutator: (current: string | undefined) => Promise<StorageLockResult<T>>,
 	): Promise<T>;
 }
 
-export class FileCodexAccountStorageBackend implements CodexAccountStorageBackend {
-	constructor(
-		private readonly filePath: string,
-		private readonly options: { syncLockTimeoutMs?: number } = {},
-	) {}
+export class FileCodexAccountStorageBackend
+	implements CodexAccountStorageBackend
+{
+	constructor(private readonly filePath: string) {}
 
-	withLock<T>(mutator: (current: string | undefined) => StorageLockResult<T>): T {
+	readRaw(): string | undefined {
 		this.ensureFileExists();
-		let release: (() => void) | undefined;
-		try {
-			release = this.acquireLockSyncWithRetry();
-			const { result, next } = mutator(readFileSync(this.filePath, "utf8"));
-			if (next !== undefined) this.writePrivate(next);
-			return result;
-		} finally {
-			release?.();
-		}
+		return readFileSync(this.filePath, "utf8");
 	}
 
 	async withLockAsync<T>(
@@ -64,7 +61,9 @@ export class FileCodexAccountStorageBackend implements CodexAccountStorageBacken
 				},
 			});
 			throwIfCompromised();
-			const { result, next } = await mutator(readFileSync(this.filePath, "utf8"));
+			const { result, next } = await mutator(
+				readFileSync(this.filePath, "utf8"),
+			);
 			throwIfCompromised();
 			if (next !== undefined) this.writePrivate(next);
 			throwIfCompromised();
@@ -93,34 +92,19 @@ export class FileCodexAccountStorageBackend implements CodexAccountStorageBacken
 		}
 	}
 
-	private acquireLockSyncWithRetry(): () => void {
-		const timeoutMs = this.options.syncLockTimeoutMs ?? DEFAULT_SYNC_LOCK_TIMEOUT_MS;
-		const deadline = Date.now() + timeoutMs;
-		while (true) {
-			try {
-				return lockfile.lockSync(this.filePath, { realpath: false });
-			} catch (error) {
-				if (!isNodeError(error) || error.code !== "ELOCKED") throw error;
-				const remainingMs = deadline - Date.now();
-				if (remainingMs <= 0) throw error;
-				Atomics.wait(syncSleepState, 0, 0, Math.min(SYNC_LOCK_RETRY_INTERVAL_MS, remainingMs));
-			}
-		}
-	}
-
 	private writePrivate(contents: string): void {
 		writeFileSync(this.filePath, contents, PRIVATE_FILE_WRITE_OPTIONS);
 		chmodSync(this.filePath, 0o600);
 	}
 }
 
-export class InMemoryCodexAccountStorageBackend implements CodexAccountStorageBackend {
+export class InMemoryCodexAccountStorageBackend
+	implements CodexAccountStorageBackend
+{
 	private value: string | undefined;
 
-	withLock<T>(mutator: (current: string | undefined) => StorageLockResult<T>): T {
-		const { result, next } = mutator(this.value);
-		if (next !== undefined) this.value = next;
-		return result;
+	readRaw(): string | undefined {
+		return this.value;
 	}
 
 	async withLockAsync<T>(
