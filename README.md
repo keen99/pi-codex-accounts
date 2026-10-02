@@ -1,133 +1,84 @@
-# 🔐 pi-codex-accounts — Codex Account Switcher for Pi
+# pi-codex-accounts
 
-[![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
+Named ChatGPT Codex credentials with independent account selection for each pi session. Fork of `@narumitw/pi-codex-accounts`; keeps `codex-accounts.json` and `accountId` for usage reporting.
 
-> [!IMPORTANT]
-> **Fork of `@narumitw/pi-codex-accounts` (v0.11.0).** Pinned to the pre-deprecation
-> version that predates upstream's storage rename and migration logic.
->
-> **Why this version:**
-> - Uses `codex-accounts.json` directly (no `pi-codex-accounts.json` rename)
-> - No migration/legacy/precedence logic (no stub regeneration, no warnings)
-> - Keeps `accountId` field (used for `ChatGPT-Account-Id` header + cache keys)
-> - Keeps `/codex-login`, `/codex-account`, `/codex-logout` commands
->
-> Upstream `0.16.0+` renamed the file to `pi-codex-accounts.json` and added migration
-> code that leaves an empty `{}` stub of the old filename and warns every session.
-> Later versions (`0.24.0`) deprecated the package entirely in favor of
-> [`@narumitw/pi-accounts`](https://github.com/narumiruna/pi-extensions/tree/main/extensions/pi-accounts),
-> a single-active-account multi-provider replacement that drops `accountId`.
->
-> `pi-usage-status` (downstream) reads `codex-accounts.json` directly and relies on
-> `accountId` to enumerate usage across multiple stored accounts. This fork keeps
-> that workflow intact by staying on the 0.11.0 codebase.
->
-> **Upstream:** [`narumiruna/pi-extensions` → `deprecated/pi-codex-accounts`](https://github.com/narumiruna/pi-extensions/tree/main/deprecated/pi-codex-accounts)
-> ([MIT](./LICENSE), © narumiruna)
+## Commands
 
----
+| Command | Effect |
+|---|---|
+| `/codex-account` | Pick an account for **this session**. |
+| `/codex-account plus` | Select plus for this session; does not write shared credentials or global default. |
+| `/codex-account default` | Select the current global default for this session. |
+| `/codex-account builtin` | Use pi's built-in Codex login for this session. |
+| `/codex-default` | Show the global default. |
+| `/codex-default teams` | Explicitly set the default for new sessions; existing sessions stay unchanged. |
+| `/codex-default builtin` | Explicitly clear the named global default. |
+| `/codex-account plus --default` | Explicitly set the global default and select plus in this session. |
+| `/codex-login plus` | Re-login plus, store its credentials, and select it in this session. The global default is unchanged. |
+| `/codex-logout plus` | Confirm removal of **shared credentials**; availability changes in all sessions. Their selections are not edited. |
 
-## ✨ Features
+Login completes in the browser while the visible input waits. Paste an authorization code or redirect URL if needed. **Escape cancels immediately**, closes that login's callback server, and leaves credentials/selection unchanged. Browser success closes the input without requiring any typing.
 
-- Adds `/codex-login <name>` for storing a named ChatGPT Codex subscription account.
-- Adds `/codex-account [name]` for switching the active self-managed Codex account.
-- Adds `/codex-logout <name>` for deleting one self-managed account.
-- Adds `(default pi login)` in the selector to clear the active self-managed account and return to Pi's normal `openai-codex` auth.
-- Stores credentials in `~/.pi/agent/codex-accounts.json` with private file permissions.
-- Sets only the runtime API key for Pi's native `openai-codex` provider.
-- Leaves your selected `/model` unchanged, matching Pi's built-in `/login` behavior, except it may select `openai-codex/gpt-5.5` when the current model is `unknown/unknown`.
-- Shows `codex:<name>` in the statusline only while the current model provider is `openai-codex`.
-- Fails closed if an active self-managed account cannot refresh, so Pi does not silently fall back to a different Codex account.
+New local names require confirmation. A local name is not a new OpenAI subscription. Existing names autocomplete; case-insensitive matches reuse their canonical spelling. After authentication, an already-stored account ID uses the existing name instead of creating a duplicate. Old duplicate entries are not automatically deleted.
 
-## 📦 Install
+## Where state belongs
 
-```bash
-pi install npm:@narumitw/pi-codex-accounts
-```
+- **Credentials and global default:** `~/.pi/agent/codex-accounts.json`.
+- **Session choice:** pi's normal `appendEntry("codex-accounts/selection-v1", {accountName})` custom session entry. No credentials are placed in the session entry. It does not enter LLM context.
+- **Reload/resume:** restore selection from the current session branch.
+- **New session:** pin its initial default once in its own session. Changing the global default later does not move that session.
+- **Tree/fork:** selection follows the current branch's custom entries.
 
-Try without installing permanently:
-
-```bash
-pi -e npm:@narumitw/pi-codex-accounts
-```
-
-Try this package locally from the repository root:
-
-```bash
-pi -e ./extensions/pi-codex-accounts
-```
-
-## 🚀 Usage
-
-Login to named accounts:
-
-```text
-/codex-login work
-/codex-login personal
-```
-
-Switch accounts:
-
-```text
-/codex-account
-/codex-account work
-```
-
-Return to Pi's built-in Codex login without deleting any self-managed account:
-
-```text
-/codex-account default
-```
-
-Remove one self-managed account:
-
-```text
-/codex-logout work
-```
-
-## 🔐 Auth behavior
-
-When an active self-managed account is set, the extension applies that account's access token as Pi's runtime key for the native `openai-codex` provider.
-
-When no self-managed account is active, the extension removes its runtime override and Pi uses its normal `openai-codex` auth resolution. That means existing `/login openai-codex`, `auth.json`, or environment behavior still works.
-
-If the active self-managed account refresh fails, the extension keeps a non-empty failing runtime key in place. This prevents accidental fallback to a different Codex account.
-
-## 🚧 Limitations
-
-- This extension supports ChatGPT Plus/Pro Codex subscription auth only.
-- It does not rotate accounts automatically or try to bypass rate limits.
-- It does not switch Claude, Anthropic, or browser-cookie sessions.
-- Multiple Pi processes refreshing the same account at the same time are serialized through Pi's auth-file lock helper, but the newest refreshed token wins.
-
-## 🗂️ Package layout
-
-```txt
-extensions/pi-codex-accounts/
-├── src/
-│   └── codex-accounts.ts
-├── test/
-│   └── codex-accounts.test.ts
-├── README.md
-├── LICENSE
-├── tsconfig.json
-└── package.json
-```
-
-The package exposes its Pi extension through `package.json`:
+Shared-file example:
 
 ```json
 {
-  "pi": {
-    "extensions": ["./src/codex-accounts.ts"]
+  "default": "plus",
+  "active": "plus",
+  "accounts": {
+    "plus": {
+      "access": "...",
+      "refresh": "...",
+      "expires": 1800000000000,
+      "accountId": "..."
+    }
   }
 }
 ```
 
-## 🔎 Keywords
+Legacy `active` is read as the global default when `default` is absent. Every actual shared write mirrors `default` into `active` for older processes; this is **not** the current session's selection. Legacy refresh writers discard `default`, but retain `active`, so newer readers still recover the same global default. Reads and session switches do not migrate or rewrite anything. If an earlier default-only file needs repair, explicitly run `/codex-default <current-default>` once; do not alter credentials manually.
 
-Pi extension, Pi coding agent, Codex, ChatGPT Plus, ChatGPT Pro, subscription account switching, OAuth.
+The abandoned shared `sessionAccounts` map is not used; session choices belong in pi sessions. On first upgrade, a session without a custom selection takes the configured default; select its intended account once. Old processes still use global `active` and can change it with their old switch command. Session isolation applies only after that process reloads the new extension.
 
-## 📄 License
+Removing a selected account does not silently substitute another. Authentication fails closed with a clear notification until that session selects a valid account or built-in login.
 
-MIT. See [`LICENSE`](./LICENSE).
+## Locking and refresh
+
+Reads are lockless and do not create files, directories, or lock entries. A missing file is an empty store. Shared writes use a bounded asynchronous lock acquisition and an atomic private temporary-file replacement. Unchanged transactions do not rewrite the file.
+
+Refresh is serialized across processes: lock, reread, recheck expiry, complete the refresh request, persist rotated credentials, then release. A request deadline aborts the transport and awaits settlement; it never releases the lock while an abandoned refresh continues in the background.
+
+Startup/model changes/switches do not refresh expired credentials or block on a write lock. The selected account is renewed before a Codex turn when needed. Other expired stored accounts are checked asynchronously after a completed turn, at most hourly. Non-Codex turns do not wait for Codex authentication.
+
+Authentication state uses bounded concurrent-change retries, not recursive re-entry. The global default is never compared against a session-selected account to validate credentials.
+
+## Login ownership
+
+The extension owns its PKCE callback server, matching pi's Codex client ID and endpoints. It closes only its own server and sockets. It does not scan process handles, kill processes, or close another listener. An occupied callback port fails immediately with an explanation. Five minutes is an overall safety deadline, not the cancellation mechanism.
+
+## Usage footer contract
+
+`pi-usage-status` reads the same `codex-accounts/selection-v1` session entry and the new/legacy global-default schema. Changes emit `codex-accounts:changed-v1` on pi's shared event bus. The previously shipped optional global refresh hook remains for backward compatibility. No file watcher or shared session map is needed.
+
+## Development tests
+
+```sh
+npm run check       # strict typecheck, offline unit/server/multiprocess tests
+npm run test:rpc    # real pi loader, runtime auth, footer, reload, login UI cancellation
+```
+
+RPC tests create an isolated agent directory and use synthetic credentials. All token/usage requests are mocked; callback tests use ephemeral ports. They never use real user configuration, accounts, or sessions. The smoke test uses `pi` alongside the current Node executable, avoiding npm's dev-dependency PATH override; set `PI_TEST_BIN` to another executable if needed. Verified against installed pi 0.75.4.
+
+Offline tests are not proof of live OpenAI availability or successful real account authentication. Test live rollout separately before shipping.
+
+MIT; see [LICENSE](LICENSE).

@@ -1,16 +1,4 @@
-import { randomUUID } from "node:crypto";
-import {
-	chmodSync,
-	closeSync,
-	linkSync,
-	lstatSync,
-	openSync,
-	readFileSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
@@ -18,15 +6,18 @@ import {
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import {
-	type CodexOAuthCallbacks,
-	type CodexOAuthPrompt,
 	type CodexOAuthProvider,
-	type CodexOAuthSelectPrompt,
-	type DeviceCodeInfo,
 	getDefaultCodexOAuthProvider,
 	type OAuthCredentials,
 	type RefreshOnlyCodexOAuthProvider,
 } from "./oauth.js";
+import { RuntimeApiKeyController } from "./runtime-auth.js";
+import {
+	ACCOUNT_CHANGED_EVENT,
+	ACCOUNT_STATE_TYPE,
+	type AccountSelection,
+	restoreAccountSelection,
+} from "./session-state.js";
 import {
 	type CodexAccountStorageBackend,
 	FileCodexAccountStorageBackend,
@@ -38,55 +29,25 @@ export const CODEX_ACCOUNTS_FILE = "codex-accounts.json";
 export const CODEX_ACCOUNTS_STATUS_KEY = "codex-accounts";
 export const DEFAULT_PI_LOGIN_LABEL = "(default pi login)";
 export const FAIL_CLOSED_API_KEY = "pi-codex-accounts-refresh-failed";
-
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
 const BACKGROUND_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
-const MIGRATION_LOCK_TIMEOUT_MS = 30_000;
 const ACCOUNT_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const runtime = new RuntimeApiKeyController(CODEX_PROVIDER_ID);
 
-type RuntimeAuthStorage = {
-	setRuntimeApiKey(provider: string, apiKey: string): void | Promise<void>;
-	removeRuntimeApiKey(provider: string): void | Promise<void>;
-};
-
-type RuntimeOverrideState = {
-	appliedApiKey?: string;
-	generation: number;
-	mayHaveOverride: boolean;
-	operationTail: Promise<void>;
-};
-
-type RuntimeOverrideSnapshot = {
-	target: RuntimeAuthStorage & object;
-	state: RuntimeOverrideState;
-	generation: number;
-};
-
-const runtimeOverrideStates = new WeakMap<object, RuntimeOverrideState>();
-
-export type StoredCodexCredential = {
-	access: string;
-	refresh: string;
-	expires: number;
-	accountId?: string;
-};
-
+export type StoredCodexCredential = OAuthCredentials;
 export type CodexAccountsData = {
-	active?: string;
+	default?: string;
 	accounts: Record<string, StoredCodexCredential>;
 };
-
 export type EnsureActiveCodexAuthResult =
 	| { status: "inactive" }
 	| { status: "active"; accountName: string }
 	| { status: "error"; accountName: string; message: string };
-
 export type CommandArgumentCompletion = {
 	value: string;
 	label: string;
 	description?: string;
 };
-
 export type CodexAccountsDependencies = {
 	store?: CodexAccountStore;
 	oauthProvider?: CodexOAuthProvider;
@@ -94,70 +55,39 @@ export type CodexAccountsDependencies = {
 };
 
 export class CodexAccountStore {
-	private readonly backend: CodexAccountStorageBackend;
-	private operationTail: Promise<void> = Promise.resolve();
-
 	constructor(
-		backend: CodexAccountStorageBackend = new FileCodexAccountStorageBackend(
-			defaultAccountsPath(),
+		private readonly backend: CodexAccountStorageBackend = new FileCodexAccountStorageBackend(
+			join(getAgentDir(), CODEX_ACCOUNTS_FILE),
 		),
-	) {
-		this.backend = backend;
-	}
-
+	) {}
 	read(): CodexAccountsData {
-		return this.parseRawWithRetry(this.backend.readRaw(), 0);
+		return parseStoredData(this.backend.readRaw());
 	}
-
 	async readAsync(): Promise<CodexAccountsData> {
-		// Lockless read: never creates/removes lock entries. A torn read
-		// (JSON parse error from a concurrent write) retries once.
-		return this.parseRawWithRetry(this.backend.readRaw(), 0);
+		return this.read();
 	}
-
-	private parseRawWithRetry(
-		raw: string | undefined,
-		attempt: number,
-	): CodexAccountsData {
-		try {
-			return parseStoredData(raw);
-		} catch (error) {
-			if (attempt === 0 && error instanceof SyntaxError) {
-				return this.parseRawWithRetry(this.backend.readRaw(), 1);
-			}
-			throw error;
-		}
-	}
-
 	async write(data: CodexAccountsData): Promise<void> {
-		await this.updateAsync(async () => data);
+		await this.update(() => data);
 	}
-
-	async update(
+	update(
 		mutator: (data: CodexAccountsData) => CodexAccountsData,
 	): Promise<CodexAccountsData> {
 		return this.updateAsync(async (data) => mutator(data));
 	}
-
-	async updateAsync(
+	updateAsync(
 		mutator: (data: CodexAccountsData) => Promise<CodexAccountsData>,
 	): Promise<CodexAccountsData> {
-		const previous = this.operationTail;
-		let release: () => void = () => undefined;
-		this.operationTail = new Promise<void>((resolve) => {
-			release = resolve;
+		return this.backend.withLockAsync(async (current) => {
+			const data = parseStoredData(current);
+			const next = await mutator(data);
+			// Returning the unchanged snapshot is a genuine no-op, including
+			// legacy files: don't migrate/rewrite merely because we inspected it.
+			return {
+				result: next,
+				...(next !== data ? { next: stringifyStoredData(next) } : {}),
+			};
 		});
-		await previous;
-		try {
-			return await this.backend.withLockAsync(async (current) => {
-				const nextData = await mutator(parseStoredData(current));
-				return { result: nextData, next: stringifyStoredData(nextData) };
-			});
-		} finally {
-			release();
-		}
 	}
-
 	async writeRawForTest(raw: string): Promise<void> {
 		await this.backend.withLockAsync(async () => ({
 			result: undefined,
@@ -166,980 +96,699 @@ export class CodexAccountStore {
 	}
 }
 
+/** Explicit name is session identity. `undefined` means shared default; null means built-in login. */
+export async function ensureActiveCodexAuth(
+	ctx: ExtensionContext,
+	store: CodexAccountStore,
+	options: {
+		oauthProvider?: RefreshOnlyCodexOAuthProvider;
+		now?: number;
+		accountName?: string | null;
+		allowRefresh?: boolean;
+		isCurrent?: () => boolean;
+	} = {},
+): Promise<EnsureActiveCodexAuthResult> {
+	const oauth =
+		options.oauthProvider ?? getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
+	const snapshot = runtime.capture(ctx);
+	const currentOperation = options.isCurrent ?? (() => true);
+	let name = options.accountName;
+	let lastError = "Credentials changed repeatedly; retry the account switch.";
+	// Bound concurrent credential-change retries. No recursive re-entry, ever.
+	for (let attempt = 0; attempt < 3; attempt++) {
+		if (!currentOperation()) return { status: "inactive" };
+		const data = await store.readAsync();
+		name =
+			options.accountName === undefined ? data.default : options.accountName;
+		if (name === null || name === undefined) {
+			await runtime.clear(ctx);
+			return { status: "inactive" };
+		}
+		let credential = ownCredential(data.accounts, name);
+		if (!credential) {
+			lastError = `Saved account "${name}" is missing. Select another account; no fallback account was used.`;
+			break;
+		}
+		try {
+			if (credential.expires <= (options.now ?? Date.now()) + REFRESH_SKEW_MS) {
+				if (options.allowRefresh === false) {
+					lastError =
+						"Token needs renewal; it will be refreshed before the next Codex turn.";
+					break;
+				}
+				const accountName = name;
+				await store.updateAsync(async (latest) => {
+					const fresh = ownCredential(latest.accounts, accountName);
+					if (!fresh || !currentOperation()) return latest;
+					if (fresh.expires > (options.now ?? Date.now()) + REFRESH_SKEW_MS) {
+						credential = fresh;
+						return latest;
+					}
+					// Lock spans the complete cancellable request AND durable write.
+					// Do not abandon this request with Promise.race.
+					credential = normalizeCredential(await oauth.refreshToken(fresh));
+					return {
+						...latest,
+						accounts: { ...latest.accounts, [accountName]: credential },
+					};
+				});
+			}
+			const apiKey = await oauth.getApiKey(credential);
+			if (!currentOperation()) return { status: "inactive" };
+			// Credential equality is independent of GLOBAL DEFAULT. Comparing
+			// default===name here caused the old hot recursion/TUI freeze.
+			if (
+				!sameCredential(
+					ownCredential((await store.readAsync()).accounts, name),
+					credential,
+				)
+			)
+				continue;
+			const applied = await runtime.apply(ctx, snapshot, apiKey);
+			if (applied === "stale") return { status: "inactive" };
+			if (applied === "unavailable") {
+				lastError = "Pi did not accept the runtime account token.";
+				break;
+			}
+			return { status: "active", accountName: name };
+		} catch (error) {
+			lastError = redactCredentialError(error, credential);
+			break;
+		}
+	}
+	if (!currentOperation()) return { status: "inactive" };
+	await runtime.apply(ctx, snapshot, FAIL_CLOSED_API_KEY);
+	return {
+		status: "error",
+		accountName: name ?? "unknown",
+		message: lastError,
+	};
+}
+
+export async function refreshStoredAccounts(
+	store: CodexAccountStore,
+	options: { oauthProvider?: RefreshOnlyCodexOAuthProvider; now?: number } = {},
+): Promise<Map<string, string>> {
+	const oauth =
+		options.oauthProvider ?? getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
+	const errors = new Map<string, string>();
+	for (const [name, initial] of Object.entries(
+		(await store.readAsync()).accounts,
+	)) {
+		if (initial.expires > (options.now ?? Date.now()) + REFRESH_SKEW_MS)
+			continue;
+		try {
+			await store.updateAsync(async (data) => {
+				const credential = ownCredential(data.accounts, name);
+				if (
+					!credential ||
+					credential.expires > (options.now ?? Date.now()) + REFRESH_SKEW_MS
+				)
+					return data;
+				const refreshed = normalizeCredential(
+					await oauth.refreshToken(credential),
+				);
+				return { ...data, accounts: { ...data.accounts, [name]: refreshed } };
+			});
+		} catch (error) {
+			errors.set(name, redactCredentialError(error, initial));
+		}
+	}
+	return errors;
+}
+
 export default function codexAccounts(
 	pi: ExtensionAPI,
 	dependencies: CodexAccountsDependencies = {},
 ) {
 	const store = dependencies.store ?? new CodexAccountStore();
-	const oauthProvider =
+	const oauth =
 		dependencies.oauthProvider ??
 		getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
-	// Keep cleanup injectable until WebSocket controls are available through a loader-safe export.
-	const closeWebSocketSessions =
-		dependencies.closeWebSocketSessions ?? (() => undefined);
-	let appliedAuthIdentity: string | undefined;
-	let authIdentityInitialized = false;
-	let backgroundRefreshNotifiedFailures = new Set<string>();
-	let lastBackgroundRefreshCheckMs = 0;
+	let selection: AccountSelection | undefined;
+	let generation = 0;
+	let stopped = false;
+	let loginAbort: AbortController | undefined;
+	let backgroundBusy = false;
+	let lastBackground = 0;
+	let identity: string | undefined;
+	let lastError: string | undefined;
 
-	const backgroundRefresh = async (ctx: ExtensionContext) => {
-		let errors: Map<string, string>;
-		try {
-			errors = await refreshStoredAccounts(store, { oauthProvider });
-		} catch (error) {
-			ctx.ui.notify(
-				`Codex background account refresh failed: ${redactTokenText(errorMessage(error))}`,
-				"warning",
-			);
-			return;
-		}
-		for (const [name, message] of errors) {
-			if (backgroundRefreshNotifiedFailures.has(name)) continue;
-			backgroundRefreshNotifiedFailures.add(name);
-			ctx.ui.notify(
-				`Codex account "${name}" token refresh failed: ${message}. Re-login with /codex-login ${name} when convenient.`,
-				"warning",
-			);
-		}
-		if (errors.size === 0) backgroundRefreshNotifiedFailures = new Set();
-	};
-
-	const sync = async (ctx: ExtensionContext, model = ctx.model) => {
-		const result = await ensureActiveCodexAuth(ctx, store, { oauthProvider });
-		const authIdentity = await getActiveAuthIdentity(store, result);
-		if (!authIdentityInitialized || appliedAuthIdentity !== authIdentity) {
-			await closeWebSocketSessions(ctx.sessionManager.getSessionId());
-			authIdentityInitialized = true;
-			appliedAuthIdentity = authIdentity;
-		}
-		updateStatus(ctx, result, model);
-		return result;
-	};
-
-	pi.registerCommand("codex-login", {
-		description: "Login to a named ChatGPT Codex subscription account",
-		handler: async (args, ctx) => {
-			const parsedName = parseAccountName(args);
-			if (!parsedName.ok) {
-				ctx.ui.notify(parsedName.error, "warning");
-				return;
-			}
-			if (isDefaultPiLoginArg(parsedName.name)) {
-				ctx.ui.notify(
-					`"${parsedName.name}" is reserved for Pi's default Codex login.`,
-					"warning",
-				);
-				return;
-			}
-			if (!ctx.hasUI) {
-				ctx.ui.notify("/codex-login requires interactive UI", "error");
-				return;
-			}
-
+	function publish(ctx: ExtensionContext) {
+		pi.events.emit(ACCOUNT_CHANGED_EVENT, {
+			sessionId: ctx.sessionManager.getSessionId(),
+			accountName: selection?.accountName ?? null,
+		});
+		// Retain the already-shipped optional hook until event-bus consumers update.
+		const hook = (globalThis as Record<string, unknown>).__piUsageStatusRefresh;
+		if (typeof hook === "function") {
 			try {
-				const credentials = await loginCodexAccount(
-					parsedName.name,
-					ctx,
-					oauthProvider,
-				);
-				await store.update((data) => ({
-					active: parsedName.name,
-					accounts: {
-						...data.accounts,
-						[parsedName.name]: normalizeCredential(credentials),
-					},
-				}));
-				const result = await sync(ctx);
-				await selectDefaultCodexModelIfUnknown(pi, ctx);
-				ctx.ui.notify(
-					formatActivatedMessage("Logged in", parsedName.name, result),
-					"info",
-				);
-				notifyUsageStatusRefresh();
-			} catch (error) {
-				ctx.ui.notify(
-					`Codex login failed: ${redactTokenText(errorMessage(error))}`,
-					"error",
-				);
+				hook();
+			} catch {
+				/* optional observer */
 			}
-		},
-	});
+		}
+	}
+	function saveSelection(name: string | null, ctx: ExtensionContext) {
+		selection = { accountName: name };
+		generation++;
+		runtime.invalidate(ctx); // Queued token writes from an older switch cannot win.
+		pi.appendEntry(ACCOUNT_STATE_TYPE, selection);
+	}
+	async function sync(
+		ctx: ExtensionContext,
+		allowRefresh = false,
+		model = ctx.model,
+	) {
+		const operation = generation;
+		const result = await ensureActiveCodexAuth(ctx, store, {
+			oauthProvider: oauth,
+			accountName: selection?.accountName,
+			allowRefresh,
+			isCurrent: () => !stopped && operation === generation,
+		});
+		if (stopped || operation !== generation) return result;
+		const nextIdentity =
+			result.status === "inactive"
+				? "builtin"
+				: `${result.status}:${result.accountName}`;
+		if (identity !== nextIdentity) {
+			await dependencies.closeWebSocketSessions?.(
+				ctx.sessionManager.getSessionId(),
+			);
+			identity = nextIdentity;
+		}
+		ctx.ui.setStatus(
+			CODEX_ACCOUNTS_STATUS_KEY,
+			isOpenAICodexModel(model) && result.status !== "inactive"
+				? `codex:${result.accountName}${result.status === "error" ? " auth error" : ""}`
+				: undefined,
+		);
+		if (result.status === "error" && lastError !== result.message)
+			ctx.ui.notify(
+				`Codex account "${result.accountName}": ${result.message}`,
+				"error",
+			);
+		lastError = result.status === "error" ? result.message : undefined;
+		return result;
+	}
+	async function switchAccount(
+		ctx: ExtensionCommandContext,
+		name: string | null,
+	) {
+		if (name !== null && !ownCredential(store.read().accounts, name))
+			throw new Error(`Codex account "${name}" was not found.`);
+		saveSelection(name, ctx);
+		const operation = generation;
+		const result = await sync(ctx);
+		if (stopped || generation !== operation) return;
+		ctx.ui.notify(
+			result.status === "error"
+				? `Selected "${name}" for this session; ${result.message}`
+				: name === null
+					? "This session uses Pi's built-in Codex login."
+					: `Activated Codex account "${name}" for this session.`,
+			result.status === "error" ? "warning" : "info",
+		);
+		publish(ctx);
+	}
+	function guarded(
+		fn: (args: string, ctx: ExtensionCommandContext) => Promise<void>,
+	) {
+		return async (args: string, ctx: ExtensionCommandContext) => {
+			try {
+				await fn(args, ctx);
+			} catch (error) {
+				ctx.ui.notify(redactTokenText(errorMessage(error)), "error");
+			}
+		};
+	}
 
 	pi.registerCommand("codex-account", {
 		description:
-			"Switch active self-managed Codex account or return to default Pi login",
+			"Select this session's Codex account; default uses global default, builtin uses Pi login. --default explicitly saves global default.",
 		getArgumentCompletions: (prefix) =>
 			completeStoredAccountArguments(prefix, store),
-		handler: async (args, ctx) => {
-			const trimmed = args.trim();
-			if (!trimmed) {
-				await showAccountSelector(ctx, store, sync);
-				return;
+		handler: guarded(async (args, ctx) => {
+			let value = args.trim();
+			if (!value) {
+				if (!ctx.hasUI) {
+					ctx.ui.notify(
+						`Accounts: ${Object.keys(store.read().accounts).join(", ")}`,
+						"info",
+					);
+					return;
+				}
+				value =
+					(await ctx.ui.select("Select Codex account for THIS session", [
+						"default",
+						"builtin",
+						...Object.keys(store.read().accounts).sort(),
+					])) ?? "";
+				if (!value) return;
 			}
-
-			if (isDefaultPiLoginArg(trimmed)) {
-				await clearActiveAccount(ctx, store, sync);
-				return;
+			const setDefault = /(?:^|\s)--default(?:\s|$)/.test(value);
+			value = value.replace(/(?:^|\s)--default(?:\s|$)/g, " ").trim();
+			const name =
+				value === "default"
+					? (store.read().default ?? null)
+					: isBuiltinArg(value)
+						? null
+						: validName(value);
+			if (name !== null && !ownCredential(store.read().accounts, name)) {
+				throw new Error(`Codex account "${name}" was not found.`);
 			}
-
-			const parsedName = parseAccountName(trimmed);
-			if (!parsedName.ok) {
-				ctx.ui.notify(parsedName.error, "warning");
-				return;
-			}
-			await activateStoredAccount(ctx, store, parsedName.name, sync);
-		},
+			if (setDefault)
+				await store.update((data) => ({ ...data, default: name ?? undefined }));
+			await switchAccount(ctx, name);
+		}),
 	});
-
-	pi.registerCommand("codex-logout", {
-		description: "Remove a self-managed Codex account",
+	pi.registerCommand("codex-default", {
+		description:
+			"Show or explicitly set GLOBAL default for new sessions. Existing sessions stay unchanged.",
 		getArgumentCompletions: (prefix) =>
-			completeStoredAccountArguments(prefix, store, {
-				includeDefault: false,
-			}),
-		handler: async (args, ctx) => {
-			const parsedName = parseAccountName(args);
-			if (!parsedName.ok) {
-				ctx.ui.notify(parsedName.error, "warning");
-				return;
-			}
-
-			let removed = false;
-			let removedActive = false;
-			await store.update((data) => {
-				if (!getOwnStoredAccount(data.accounts, parsedName.name)) return data;
-				removed = true;
-				removedActive = data.active === parsedName.name;
-				const accounts = { ...data.accounts };
-				delete accounts[parsedName.name];
-				return { active: removedActive ? undefined : data.active, accounts };
-			});
-			if (!removed) {
+			completeStoredAccountArguments(prefix, store, { includeDefault: false }),
+		handler: guarded(async (args, ctx) => {
+			const value = args.trim();
+			if (!value) {
 				ctx.ui.notify(
-					`Codex account "${parsedName.name}" was not found.`,
-					"warning",
+					`Global Codex default: ${store.read().default ?? "builtin"}`,
+					"info",
 				);
 				return;
 			}
-
-			if (removedActive) await sync(ctx);
-			ctx.ui.notify(`Removed Codex account "${parsedName.name}".`, "info");
-			notifyUsageStatusRefresh();
-		},
+			const name = isBuiltinArg(value) ? null : validName(value);
+			if (name !== null && !ownCredential(store.read().accounts, name))
+				throw new Error(`No stored account "${name}".`);
+			await store.update((data) => ({ ...data, default: name ?? undefined }));
+			ctx.ui.notify(
+				`Global default: ${name ?? "builtin"}. Existing sessions unchanged.`,
+				"info",
+			);
+		}),
+	});
+	pi.registerCommand("codex-login", {
+		description:
+			"Re-login a named account, or confirm creating a new local account name. Escape cancels.",
+		getArgumentCompletions: (prefix) =>
+			completeStoredAccountArguments(prefix, store, { includeDefault: false }),
+		handler: guarded(async (args, ctx) => {
+			if (!ctx.hasUI) throw new Error("/codex-login requires interactive UI");
+			if (loginAbort)
+				throw new Error("A Codex login is already running in this session.");
+			let name = validName(args);
+			const accounts = store.read().accounts;
+			const exact = Object.keys(accounts).find(
+				(key) => key.toLowerCase() === name.toLowerCase(),
+			);
+			if (exact) name = exact;
+			else {
+				const close = Object.keys(accounts).filter(
+					(key) => editDistance(key.toLowerCase(), name.toLowerCase()) <= 2,
+				);
+				const text =
+					`Create local Codex account name "${name}"? Existing: ${Object.keys(accounts).join(", ") || "none"}.` +
+					(close.length
+						? ` Similar names: ${close.join(", ")}. Cancel and choose one to re-login instead.`
+						: "") +
+					" This does not create an OpenAI subscription.";
+				if (!(await ctx.ui.confirm("New Codex account name", text))) return;
+			}
+			const controller = new AbortController();
+			loginAbort = controller;
+			const operation = generation;
+			try {
+				const credential = normalizeCredential(
+					await loginCodexAccount(name, ctx, oauth, controller),
+				);
+				if (stopped || operation !== generation) return;
+				let target = name;
+				await store.update((data) => {
+					// Keep an existing canonical name; never delete another name or
+					// unrelated credentials implicitly. Old duplicates need explicit cleanup.
+					if (!ownCredential(data.accounts, name))
+						target =
+							Object.keys(data.accounts).find(
+								(key) =>
+									credential.accountId &&
+									data.accounts[key].accountId === credential.accountId,
+							) ?? name;
+					return {
+						...data,
+						accounts: { ...data.accounts, [target]: credential },
+					};
+				});
+				if (target !== name)
+					ctx.ui.notify(
+						`Same OpenAI account already stored as "${target}"; refreshed that entry. No "${name}" entry created.`,
+						"info",
+					);
+				await switchAccount(ctx, target);
+			} finally {
+				controller.abort();
+				if (loginAbort === controller) loginAbort = undefined;
+			}
+		}),
+	});
+	pi.registerCommand("codex-logout", {
+		description:
+			"Remove shared credentials for an account (affects availability in all sessions); asks confirmation.",
+		getArgumentCompletions: (prefix) =>
+			completeStoredAccountArguments(prefix, store, { includeDefault: false }),
+		handler: guarded(async (args, ctx) => {
+			const name = validName(args);
+			if (!ownCredential(store.read().accounts, name))
+				throw new Error(`No stored account "${name}".`);
+			if (
+				!ctx.hasUI ||
+				!(await ctx.ui.confirm(
+					"Remove shared Codex credentials?",
+					`Remove "${name}"? Other sessions using it will report missing credentials, not silently switch. Their session state will not change.`,
+				))
+			)
+				return;
+			await store.update((data) => {
+				const accounts = { ...data.accounts };
+				delete accounts[name];
+				return { ...data, accounts };
+			});
+			await sync(ctx);
+			publish(ctx);
+			ctx.ui.notify(
+				`Removed credentials for "${name}". Session selections and global default were not changed.`,
+				"info",
+			);
+		}),
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	async function init(ctx: ExtensionContext) {
+		stopped = false;
+		selection = restoreAccountSelection(ctx.sessionManager.getBranch());
+		if (!selection) {
+			// Pin the default in THIS session's normal custom state, not shared JSON.
+			// No credential file/lock is created or written at startup.
+			saveSelection(store.read().default ?? null, ctx);
+		} else generation++;
 		await sync(ctx);
-		backgroundRefreshNotifiedFailures = new Set();
-		lastBackgroundRefreshCheckMs = Date.now();
-		await backgroundRefresh(ctx);
-	});
-
+		publish(ctx);
+	}
+	function eventGuard(fn: (ctx: ExtensionContext) => Promise<void>) {
+		return async (_event: unknown, ctx: ExtensionContext) => {
+			try {
+				await fn(ctx);
+			} catch (error) {
+				ctx.ui.notify(
+					`Codex: ${redactTokenText(errorMessage(error))}`,
+					"error",
+				);
+			}
+		};
+	}
+	pi.on("session_start", eventGuard(init));
+	pi.on(
+		"session_tree",
+		eventGuard(async (ctx) => {
+			await init(ctx);
+		}),
+	);
 	pi.on("model_select", async (event, ctx) => {
-		await sync(ctx, event.model);
+		try {
+			await sync(ctx, false, event.model);
+			publish(ctx);
+		} catch (error) {
+			ctx.ui.notify(`Codex: ${redactTokenText(errorMessage(error))}`, "error");
+		}
 	});
-
-	pi.on("before_agent_start", async (_event, ctx) => {
-		await sync(ctx);
-		const now = Date.now();
-		if (now - lastBackgroundRefreshCheckMs < BACKGROUND_REFRESH_INTERVAL_MS)
+	pi.on(
+		"before_agent_start",
+		eventGuard(async (ctx) => {
+			if (isOpenAICodexModel(ctx.model)) {
+				await sync(ctx, true);
+				publish(ctx);
+			}
+		}),
+	);
+	pi.on("agent_end", (_event, ctx) => {
+		if (
+			backgroundBusy ||
+			Date.now() - lastBackground < BACKGROUND_REFRESH_INTERVAL_MS
+		)
 			return;
-		lastBackgroundRefreshCheckMs = now;
-		await backgroundRefresh(ctx);
+		lastBackground = Date.now();
+		backgroundBusy = true;
+		// Renew other stored accounts without blocking startup, model changes,
+		// commands, or unrelated model turns. Lock stays held through each refresh.
+		void refreshStoredAccounts(store, { oauthProvider: oauth })
+			.then((errors) => {
+				if (!stopped)
+					for (const [name, message] of errors)
+						ctx.ui.notify(
+							`Codex account "${name}" renewal failed: ${message}`,
+							"warning",
+						);
+			})
+			.catch((error) => {
+				if (!stopped)
+					ctx.ui.notify(
+						`Codex background renewal: ${redactTokenText(errorMessage(error))}`,
+						"warning",
+					);
+			})
+			.finally(() => {
+				backgroundBusy = false;
+			});
 	});
-
 	pi.on("session_shutdown", async (_event, ctx) => {
-		await clearRuntimeCodexAuth(ctx);
-		setStatus(ctx, undefined);
+		stopped = true;
+		generation++;
+		loginAbort?.abort();
+		await runtime.clear(ctx);
+		ctx.ui.setStatus(CODEX_ACCOUNTS_STATUS_KEY, undefined);
 	});
+}
+
+export async function loginCodexAccount(
+	name: string,
+	ctx: ExtensionCommandContext,
+	oauth: CodexOAuthProvider,
+	controller = new AbortController(),
+): Promise<OAuthCredentials> {
+	const tag = `[codex:${name}]`;
+	const timeout = setTimeout(
+		() => controller.abort(new Error("Codex login timed out")),
+		5 * 60 * 1000,
+	);
+	try {
+		return await oauth.login({
+			signal: controller.signal,
+			onAuth: ({ url, instructions }) =>
+				ctx.ui.notify(`${tag} ${url}\n${instructions ?? ""}`, "info"),
+			onProgress: (text) => ctx.ui.notify(`${tag} ${text}`, "info"),
+			onManualCodeInput: async () => {
+				const value = await ctx.ui.input(
+					`${tag} Waiting for browser login. Paste code/redirect URL if needed. Escape cancels.`,
+					"",
+					{ signal: controller.signal },
+				);
+				if (!value) {
+					controller.abort(new Error("Codex login cancelled"));
+					throw new Error("Codex login cancelled");
+				}
+				return value;
+			},
+			onPrompt: async (prompt) => {
+				const value = await ctx.ui.input(
+					`${tag} ${prompt.message}`,
+					prompt.placeholder ?? "",
+					{ signal: controller.signal },
+				);
+				if (!value) {
+					controller.abort(new Error("Codex login cancelled"));
+					throw new Error("Codex login cancelled");
+				}
+				return value;
+			},
+		});
+	} finally {
+		clearTimeout(timeout);
+		controller.abort();
+	}
 }
 
 export function parseAccountName(
 	input: string,
 ): { ok: true; name: string } | { ok: false; error: string } {
 	const name = input.trim();
-	if (!name) return { ok: false, error: "Account name is required." };
-	if (!ACCOUNT_NAME_RE.test(name)) {
+	if (!ACCOUNT_NAME_RE.test(name))
 		return {
 			ok: false,
 			error:
 				"Account names must be 1-64 characters using letters, numbers, dot, underscore, or hyphen.",
 		};
-	}
 	return { ok: true, name };
 }
-
-/**
- * Refreshes every stored account whose access token is expired (or within the refresh
- * skew window), not just the active one. Runs each refresh inside the store lock so a
- * concurrent Pi session or the active-account sync cannot double-refresh the same
- * credential (OpenAI rotates refresh tokens, so a second refresh with the old token
- * would fail). Failures never throw; they are returned per account so callers can
- * surface them without blocking startup.
- */
-export async function refreshStoredAccounts(
-	store: CodexAccountStore,
-	options: { oauthProvider?: RefreshOnlyCodexOAuthProvider; now?: number } = {},
-): Promise<Map<string, string>> {
-	const oauthProvider =
-		options.oauthProvider ?? getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
-	const now = options.now ?? Date.now();
-	const errors = new Map<string, string>();
-	const data = await store.readAsync();
-	for (const [name, credential] of Object.entries(data.accounts)) {
-		if (credential.expires > now + REFRESH_SKEW_MS) continue;
-		await store.updateAsync(async (latest) => {
-			const latestCredential = latest.accounts[name];
-			if (
-				!latestCredential ||
-				latestCredential.expires > Date.now() + REFRESH_SKEW_MS
-			) {
-				return latest;
-			}
-			try {
-				const refreshed = normalizeCredential(
-					await oauthProvider.refreshToken(latestCredential),
-				);
-				return {
-					...latest,
-					accounts: { ...latest.accounts, [name]: refreshed },
-				};
-			} catch (error) {
-				errors.set(name, redactCredentialError(error, latestCredential));
-				return latest;
-			}
-		});
-	}
-	return errors;
+function validName(input: string): string {
+	const parsed = parseAccountName(input);
+	if (!parsed.ok) throw new Error(parsed.error);
+	if (
+		["default", "builtin", "--default", DEFAULT_PI_LOGIN_LABEL].includes(
+			parsed.name.toLowerCase(),
+		)
+	)
+		throw new Error(
+			"That name is reserved for default/built-in account selection.",
+		);
+	return parsed.name;
 }
-
-export async function ensureActiveCodexAuth(
-	ctx: ExtensionContext,
+export function completeStoredAccountArguments(
+	prefix: string,
 	store: CodexAccountStore,
-	options: { oauthProvider?: RefreshOnlyCodexOAuthProvider; now?: number } = {},
-): Promise<EnsureActiveCodexAuthResult> {
-	const runtimeOverride = captureRuntimeOverride(ctx);
-	const data = await store.readAsync();
-	const active = data.active;
-	if (!active) {
-		await clearRuntimeCodexAuth(ctx);
-		return { status: "inactive" };
-	}
-
-	let credential = getOwnStoredAccount(data.accounts, active);
-	if (!credential) {
-		const current = await store.update((latest) => {
-			if (
-				latest.active !== active ||
-				getOwnStoredAccount(latest.accounts, active)
-			)
-				return latest;
-			return { ...latest, active: undefined };
-		});
-		if (current.active) return ensureActiveCodexAuth(ctx, store, options);
-		await clearRuntimeCodexAuth(ctx);
-		return { status: "inactive" };
-	}
-
-	const oauthProvider =
-		options.oauthProvider ?? getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
-	if (credential.expires <= (options.now ?? Date.now()) + REFRESH_SKEW_MS) {
-		let refreshError: unknown;
-		const current = await store.updateAsync(async (latest) => {
-			const latestCredential = getOwnStoredAccount(latest.accounts, active);
-			if (latest.active !== active || !latestCredential) return latest;
-			credential = latestCredential;
-			if (
-				latestCredential.expires >
-				(options.now ?? Date.now()) + REFRESH_SKEW_MS
-			) {
-				return latest;
-			}
-			try {
-				const refreshed = normalizeCredential(
-					await oauthProvider.refreshToken(latestCredential),
-				);
-				credential = refreshed;
-				return {
-					...latest,
-					accounts: { ...latest.accounts, [active]: refreshed },
-				};
-			} catch (error) {
-				refreshError = error;
-				return latest;
-			}
-		});
-		if (
-			current.active !== active ||
-			!getOwnStoredAccount(current.accounts, active)
-		) {
-			return ensureActiveCodexAuth(ctx, store, options);
-		}
-		if (refreshError !== undefined) {
-			if (!(await activeCredentialMatches(store, active, credential))) {
-				return ensureActiveCodexAuth(ctx, store, options);
-			}
-			if (
-				!(await setRuntimeCodexApiKey(runtimeOverride, FAIL_CLOSED_API_KEY))
-			) {
-				return { status: "inactive" };
-			}
-			return {
-				status: "error",
-				accountName: active,
-				message: redactCredentialError(refreshError, credential),
-			};
-		}
-	}
-
-	let apiKey: string;
+	options: { includeDefault?: boolean } = {},
+): CommandArgumentCompletion[] {
 	try {
-		apiKey = await oauthProvider.getApiKey(credential);
-	} catch (error) {
-		if (!(await activeCredentialMatches(store, active, credential))) {
-			return ensureActiveCodexAuth(ctx, store, options);
-		}
-		if (!(await setRuntimeCodexApiKey(runtimeOverride, FAIL_CLOSED_API_KEY))) {
-			return { status: "inactive" };
-		}
-		return {
-			status: "error",
-			accountName: active,
-			message: redactCredentialError(error, credential),
-		};
+		const items = Object.keys(store.read().accounts)
+			.sort()
+			.map((name) => ({ value: name, label: name }));
+		if (options.includeDefault !== false)
+			items.unshift(
+				{ value: "default", label: "Global default (this session only)" },
+				{ value: "builtin", label: DEFAULT_PI_LOGIN_LABEL },
+			);
+		return items.filter((item) => item.value.startsWith(prefix.trim()));
+	} catch {
+		return [];
 	}
-	if (!(await activeCredentialMatches(store, active, credential))) {
-		return ensureActiveCodexAuth(ctx, store, options);
-	}
-	if (!(await setRuntimeCodexApiKey(runtimeOverride, apiKey))) {
-		return { status: "inactive" };
-	}
-	return { status: "active", accountName: active };
 }
-
-async function activeCredentialMatches(
-	store: CodexAccountStore,
-	accountName: string,
+export function isOpenAICodexModel(
+	model: { provider?: string } | undefined,
+): boolean {
+	return model?.provider === CODEX_PROVIDER_ID;
+}
+function isBuiltinArg(value: string): boolean {
+	return value === "builtin" || value === DEFAULT_PI_LOGIN_LABEL;
+}
+function ownCredential(
+	accounts: Record<string, StoredCodexCredential>,
+	name: string,
+): StoredCodexCredential | undefined {
+	return Object.hasOwn(accounts, name) ? accounts[name] : undefined;
+}
+function sameCredential(
+	current: StoredCodexCredential | undefined,
 	expected: StoredCodexCredential,
-): Promise<boolean> {
-	const latest = await store.readAsync();
-	const current = getOwnStoredAccount(latest.accounts, accountName);
+): boolean {
 	return (
-		latest.active === accountName &&
-		current !== undefined &&
+		!!current &&
 		current.access === expected.access &&
 		current.refresh === expected.refresh &&
 		current.expires === expected.expires &&
 		current.accountId === expected.accountId
 	);
 }
-
-export function completeStoredAccountArguments(
-	argumentPrefix: string,
-	store: CodexAccountStore,
-	options: { includeDefault?: boolean } = {},
-): CommandArgumentCompletion[] {
-	const includeDefault = options.includeDefault ?? true;
-	let names: string[] = [];
-	try {
-		names = Object.keys(store.read().accounts).sort();
-	} catch {
-		return [];
-	}
-
-	const items: CommandArgumentCompletion[] = includeDefault
-		? [
-				{
-					value: "default",
-					label: DEFAULT_PI_LOGIN_LABEL,
-					description: "Use Pi's built-in Codex login",
-				},
-			]
-		: [];
-	for (const name of names) items.push({ value: name, label: name });
-
-	const prefix = argumentPrefix.trim();
-	return prefix ? items.filter((item) => item.value.startsWith(prefix)) : items;
-}
-
-export function isOpenAICodexModel(
-	model: Pick<NonNullable<ExtensionContext["model"]>, "provider"> | undefined,
-): boolean {
-	return model?.provider === CODEX_PROVIDER_ID;
-}
-
-function defaultAccountsPath(): string {
-	const agentDir = getAgentDir();
-	const canonicalPath = join(agentDir, CODEX_ACCOUNTS_FILE);
-	return canonicalPath;
-}
-
-function enforcePrivateFilePermissions(filePath: string): string | undefined {
-	try {
-		if (lstatSync(filePath).isDirectory()) {
-			return `Codex accounts path is a directory and permissions were not changed: ${filePath}`;
-		}
-		chmodSync(filePath, 0o600);
-		return undefined;
-	} catch (error) {
-		return `Failed to enforce 0600 permissions for ${filePath}: ${errorMessage(error)}`;
-	}
-}
-
-type FileIdentity = { dev: number; ino: number };
-
-function installPrivateFileExclusively(
-	filePath: string,
-	contents: string,
-): FileIdentity {
-	const tempFile = join(
-		dirname(filePath),
-		`.${CODEX_ACCOUNTS_FILE}.${randomUUID()}.tmp`,
-	);
-	try {
-		writeFileSync(tempFile, contents, {
-			encoding: "utf8",
-			flag: "wx",
-			mode: 0o600,
-		});
-		chmodSync(tempFile, 0o600);
-		const identity = lstatSync(tempFile);
-		linkSync(tempFile, filePath);
-		return { dev: identity.dev, ino: identity.ino };
-	} finally {
-		try {
-			rmSync(tempFile, { force: true });
-		} catch {
-			// Best-effort temp cleanup.
-		}
-	}
-}
-
-function removeFileIfIdentityMatches(
-	filePath: string,
-	expected: FileIdentity,
-	expectedContents: string,
-) {
-	try {
-		const current = lstatSync(filePath);
-		if (current.dev !== expected.dev || current.ino !== expected.ino)
-			return false;
-		if (readFileSync(filePath, "utf8") !== expectedContents) return false;
-		rmSync(filePath);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function fileContentsEqual(filePath: string, expected: string) {
-	try {
-		return readFileSync(filePath, "utf8") === expected;
-	} catch {
-		return false;
-	}
-}
-
-function pathEntryExists(filePath: string): boolean {
-	try {
-		lstatSync(filePath);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function readableFileExists(filePath: string): boolean {
-	let descriptor: number | undefined;
-	try {
-		if (!statSync(filePath).isFile()) return false;
-		descriptor = openSync(filePath, "r");
-		return true;
-	} catch {
-		return false;
-	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-	}
-}
-
-function parseStoredData(raw: string | undefined): CodexAccountsData {
+export function parseStoredData(raw: string | undefined): CodexAccountsData {
 	if (!raw?.trim()) return { accounts: {} };
-
-	let parsed: unknown;
+	let parsed: Record<string, unknown>;
 	try {
-		parsed = JSON.parse(raw) as unknown;
+		parsed = JSON.parse(raw);
 	} catch {
 		throw new Error(
-			`Invalid Codex accounts JSON. Fix or remove ${CODEX_ACCOUNTS_FILE}.`,
+			"Invalid Codex accounts JSON; no credentials were changed.",
 		);
 	}
-
-	if (!isRecord(parsed))
-		throw new Error("Invalid Codex accounts data: expected an object.");
-	const accounts = parseAccounts(parsed.accounts);
-	const active = parseActiveAccount(parsed.active);
-	return active ? { active, accounts } : { accounts };
-}
-
-function getOwnStoredAccount(
-	accounts: Record<string, StoredCodexCredential>,
-	name: string,
-): StoredCodexCredential | undefined {
-	return Object.hasOwn(accounts, name) ? accounts[name] : undefined;
-}
-
-function parseAccounts(
-	rawAccounts: unknown,
-): Record<string, StoredCodexCredential> {
-	if (rawAccounts === undefined) return {};
-	if (!isRecord(rawAccounts))
-		throw new Error("Invalid Codex accounts data: accounts must be an object.");
-
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+		throw new Error("Codex accounts data must be an object.");
+	const rawDefault = Object.hasOwn(parsed, "default")
+		? parsed.default
+		: parsed.active;
+	let defaultName: string | undefined;
+	if (rawDefault !== undefined && rawDefault !== null) {
+		if (typeof rawDefault !== "string" || !parseAccountName(rawDefault).ok)
+			throw new Error("Invalid global Codex default name.");
+		defaultName = rawDefault;
+	}
 	const accounts: Record<string, StoredCodexCredential> = {};
-	for (const [name, rawCredential] of Object.entries(rawAccounts)) {
-		const parsedName = parseAccountName(name);
-		if (!parsedName.ok)
-			throw new Error(
-				`Invalid Codex accounts data: bad account name "${name}".`,
-			);
-		Object.defineProperty(accounts, name, {
-			configurable: true,
-			enumerable: true,
-			value: normalizeCredential(rawCredential, name),
-			writable: true,
-		});
-	}
-	return accounts;
-}
-
-function parseActiveAccount(rawActive: unknown): string | undefined {
-	if (rawActive === undefined || rawActive === null) return undefined;
-	if (typeof rawActive !== "string") {
-		throw new Error("Invalid Codex accounts data: active must be a string.");
-	}
-	const parsed = parseAccountName(rawActive);
-	if (!parsed.ok)
-		throw new Error(
-			"Invalid Codex accounts data: active account name is invalid.",
-		);
-	return parsed.name;
-}
-
-function stringifyStoredData(data: CodexAccountsData): string {
-	return `${JSON.stringify(parseStoredData(JSON.stringify(data)), null, 2)}\n`;
-}
-
-function normalizeCredential(
-	rawCredential: unknown,
-	accountName = "account",
-): StoredCodexCredential {
-	if (!isRecord(rawCredential)) {
-		throw new Error(
-			`Invalid Codex accounts data: ${accountName} credential must be an object.`,
-		);
-	}
-	if (typeof rawCredential.access !== "string" || !rawCredential.access) {
-		throw new Error(
-			`Invalid Codex accounts data: ${accountName} credential is missing access token.`,
-		);
-	}
-	if (typeof rawCredential.refresh !== "string" || !rawCredential.refresh) {
-		throw new Error(
-			`Invalid Codex accounts data: ${accountName} credential is missing refresh token.`,
-		);
-	}
-	if (
-		typeof rawCredential.expires !== "number" ||
-		!Number.isFinite(rawCredential.expires)
-	) {
-		throw new Error(
-			`Invalid Codex accounts data: ${accountName} credential has invalid expiration.`,
-		);
-	}
-	const accountId =
-		typeof rawCredential.accountId === "string"
-			? rawCredential.accountId
-			: undefined;
-	return accountId
-		? {
-				access: rawCredential.access,
-				refresh: rawCredential.refresh,
-				expires: rawCredential.expires,
-				accountId,
-			}
-		: {
-				access: rawCredential.access,
-				refresh: rawCredential.refresh,
-				expires: rawCredential.expires,
-			};
-}
-
-async function loginCodexAccount(
-	name: string,
-	ctx: ExtensionCommandContext,
-	oauthProvider: CodexOAuthProvider,
-): Promise<OAuthCredentials> {
-	ctx.ui.notify(`Starting Codex login for "${name}".`, "info");
-	const callbacks = {
-		onAuth: (info: { url: string; instructions?: string }) => {
-			ctx.ui.notify(formatAuthMessage(info.url, info.instructions), "info");
-		},
-		onDeviceCode: (info: DeviceCodeInfo) => {
-			ctx.ui.notify(formatDeviceCodeMessage(info), "info");
-		},
-		onPrompt: async (prompt: CodexOAuthPrompt) => {
-			const value = await ctx.ui.input(
-				prompt.message,
-				prompt.placeholder ?? "",
-				{
-					signal: prompt.signal,
-				},
-			);
-			if ((value === undefined || value === "") && !prompt.allowEmpty) {
-				throw new Error("Login cancelled");
-			}
-			return value ?? "";
-		},
-		onProgress: (message: string) => ctx.ui.notify(message, "info"),
-		onSelect: async (prompt: CodexOAuthSelectPrompt) => {
-			const selected = await ctx.ui.select(
-				prompt.message,
-				prompt.options.map((option) => option.label),
-				{ signal: prompt.signal },
-			);
-			return prompt.options.find((option) => option.label === selected)?.id;
-		},
-		signal: ctx.signal,
-	} as CodexOAuthCallbacks;
-
-	return oauthProvider.login(callbacks);
-}
-
-function formatAuthMessage(url: string, instructions?: string): string {
-	return ["Open this URL to login to Codex:", url, instructions]
-		.filter(Boolean)
-		.join("\n");
-}
-
-function formatDeviceCodeMessage(info: DeviceCodeInfo): string {
-	return [
-		"Open this URL and enter the Codex login code:",
-		info.verificationUri,
-		`Code: ${info.userCode}`,
-	]
-		.filter(Boolean)
-		.join("\n");
-}
-
-async function showAccountSelector(
-	ctx: ExtensionCommandContext,
-	store: CodexAccountStore,
-	sync: (ctx: ExtensionContext) => Promise<EnsureActiveCodexAuthResult>,
-): Promise<void> {
-	const data = await store.readAsync();
-	const names = Object.keys(data.accounts).sort();
-	if (!ctx.hasUI) {
-		ctx.ui.notify(
-			`Codex accounts: ${[DEFAULT_PI_LOGIN_LABEL, ...names].join(", ")}. Use /codex-account <name>.`,
-			"info",
-		);
-		return;
-	}
-
-	const selected = await ctx.ui.select("Select Codex account:", [
-		DEFAULT_PI_LOGIN_LABEL,
-		...names,
-	]);
-	if (!selected) return;
-	if (selected === DEFAULT_PI_LOGIN_LABEL) {
-		await clearActiveAccount(ctx, store, sync);
-		return;
-	}
-	await activateStoredAccount(ctx, store, selected, sync);
-}
-
-async function activateStoredAccount(
-	ctx: ExtensionCommandContext,
-	store: CodexAccountStore,
-	name: string,
-	sync: (ctx: ExtensionContext) => Promise<EnsureActiveCodexAuthResult>,
-): Promise<void> {
-	let activated = false;
-	await store.update((data) => {
-		if (!getOwnStoredAccount(data.accounts, name)) return data;
-		activated = true;
-		return { ...data, active: name };
-	});
-	if (!activated) {
-		ctx.ui.notify(`Codex account "${name}" was not found.`, "warning");
-		return;
-	}
-	const result = await sync(ctx);
-	ctx.ui.notify(
-		formatActivatedMessage("Activated", name, result),
-		result.status === "error" ? "error" : "info",
-	);
-	notifyUsageStatusRefresh();
-}
-
-async function clearActiveAccount(
-	ctx: ExtensionCommandContext,
-	store: CodexAccountStore,
-	sync: (ctx: ExtensionContext) => Promise<EnsureActiveCodexAuthResult>,
-): Promise<void> {
-	await store.update((data) => ({ ...data, active: undefined }));
-	await sync(ctx);
-	ctx.ui.notify("Using default Pi Codex login.", "info");
-	notifyUsageStatusRefresh();
-}
-
-/**
- * Cross-extension handshake: pi fires no event when /codex-account switches an
- * account, so pi-usage-status exposes globalThis.__piUsageStatusRefresh and we
- * call it after any auth change so the usage footer updates immediately.
- * Guarded: no-op when pi-usage-status is not installed.
- */
-function notifyUsageStatusRefresh(): void {
-	const hook = (globalThis as Record<string, unknown>).__piUsageStatusRefresh;
-	if (typeof hook === "function") (hook as () => void)();
-}
-
-function isDefaultPiLoginArg(arg: string): boolean {
-	const normalized = arg.trim().toLowerCase();
-	return (
-		normalized === "default" ||
-		normalized === "--default" ||
-		normalized === DEFAULT_PI_LOGIN_LABEL
-	);
-}
-
-async function selectDefaultCodexModelIfUnknown(
-	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-): Promise<void> {
-	if (!isUnknownModel(ctx.model)) return;
-	const model = ctx.modelRegistry.find(
-		CODEX_PROVIDER_ID,
-		DEFAULT_CODEX_MODEL_ID,
-	);
-	if (!model) {
-		ctx.ui.notify(
-			`Logged in, but ${CODEX_PROVIDER_ID}/${DEFAULT_CODEX_MODEL_ID} was not found.`,
-			"warning",
-		);
-		return;
-	}
-	const ok = await pi.setModel(model);
-	if (!ok)
-		ctx.ui.notify(
-			`Logged in, but selecting ${DEFAULT_CODEX_MODEL_ID} failed.`,
-			"warning",
-		);
-}
-
-function isUnknownModel(
-	model: NonNullable<ExtensionContext["model"]> | undefined,
-): boolean {
-	return (
-		model?.provider === "unknown" &&
-		model.id === "unknown" &&
-		model.api === "unknown"
-	);
-}
-
-function formatActivatedMessage(
-	action: "Logged in" | "Activated",
-	name: string,
-	result: EnsureActiveCodexAuthResult,
-): string {
-	if (result.status === "error") {
-		return `${action} Codex account "${name}", but authentication failed; Codex requests will fail closed: ${result.message}`;
-	}
-	return `${action} Codex account "${name}".`;
-}
-
-async function getActiveAuthIdentity(
-	store: CodexAccountStore,
-	result: EnsureActiveCodexAuthResult,
-): Promise<string> {
-	if (result.status === "inactive") return "default";
-	if (result.status === "error") return `error:${result.accountName}`;
-	const data = await store.readAsync();
-	return `${result.accountName}:${getOwnStoredAccount(data.accounts, result.accountName)?.access ?? "missing"}`;
-}
-
-function updateStatus(
-	ctx: ExtensionContext,
-	result: EnsureActiveCodexAuthResult,
-	model = ctx.model,
-): void {
-	if (!isOpenAICodexModel(model)) {
-		setStatus(ctx, undefined);
-		return;
-	}
-	if (result.status === "active") {
-		setStatus(ctx, `codex:${result.accountName}`);
-		return;
-	}
-	if (result.status === "error") {
-		setStatus(ctx, `codex:${result.accountName} auth error`);
-		return;
-	}
-	setStatus(ctx, undefined);
-}
-
-function setStatus(ctx: ExtensionContext, value: string | undefined): void {
-	try {
-		ctx.ui.setStatus(CODEX_ACCOUNTS_STATUS_KEY, value);
-	} catch (error) {
-		if (!isStaleExtensionContextError(error)) throw error;
-	}
-}
-
-async function setRuntimeCodexApiKey(
-	snapshot: RuntimeOverrideSnapshot | undefined,
-	apiKey: string,
-): Promise<boolean> {
-	if (!snapshot)
-		throw new Error(
-			"This Pi version does not expose runtime provider authentication.",
-		);
-	const { generation, state, target } = snapshot;
-	return enqueueRuntimeOverrideMutation(state, async () => {
-		if (state.generation !== generation) return false;
-		if (state.appliedApiKey === apiKey) return true;
-		state.appliedApiKey = undefined;
-		state.mayHaveOverride = true;
-		await target.setRuntimeApiKey(CODEX_PROVIDER_ID, apiKey);
-		state.appliedApiKey = apiKey;
-		return state.generation === generation;
-	});
-}
-
-async function clearRuntimeCodexAuth(ctx: ExtensionContext): Promise<void> {
-	const target = getRuntimeAuthStorage(ctx);
-	if (!target) return;
-	const state = runtimeOverrideStates.get(target);
-	if (!state) return;
-	state.generation += 1;
-	await enqueueRuntimeOverrideMutation(state, async () => {
-		if (!state.mayHaveOverride) return;
-		await target.removeRuntimeApiKey(CODEX_PROVIDER_ID);
-		state.appliedApiKey = undefined;
-		state.mayHaveOverride = false;
-	});
-}
-
-function captureRuntimeOverride(
-	ctx: ExtensionContext,
-): RuntimeOverrideSnapshot | undefined {
-	const target = getRuntimeAuthStorage(ctx);
-	if (!target) return undefined;
-	const state = getRuntimeOverrideState(target);
-	return { target, state, generation: state.generation };
-}
-
-function getRuntimeOverrideState(target: object): RuntimeOverrideState {
-	let state = runtimeOverrideStates.get(target);
-	if (!state) {
-		state = {
-			generation: 0,
-			mayHaveOverride: false,
-			operationTail: Promise.resolve(),
-		};
-		runtimeOverrideStates.set(target, state);
-	}
-	return state;
-}
-
-function enqueueRuntimeOverrideMutation<T>(
-	state: RuntimeOverrideState,
-	mutate: () => Promise<T>,
-): Promise<T> {
-	const operation = state.operationTail.then(mutate);
-	state.operationTail = operation.then(
-		() => undefined,
-		() => undefined,
-	);
-	return operation;
-}
-
-function getRuntimeAuthStorage(
-	ctx: ExtensionContext,
-): (RuntimeAuthStorage & object) | undefined {
-	const registry = ctx.modelRegistry as unknown as {
-		authStorage?: unknown;
-		runtime?: unknown;
-	};
-	for (const candidate of [registry, registry.runtime, registry.authStorage]) {
-		if (isRuntimeAuthStorage(candidate)) return candidate;
-	}
-	return undefined;
-}
-
-function isRuntimeAuthStorage(
-	value: unknown,
-): value is RuntimeAuthStorage & object {
-	return (
-		!!value &&
-		typeof value === "object" &&
-		"setRuntimeApiKey" in value &&
-		typeof value.setRuntimeApiKey === "function" &&
-		"removeRuntimeApiKey" in value &&
-		typeof value.removeRuntimeApiKey === "function"
-	);
-}
-
-function isStaleExtensionContextError(error: unknown): boolean {
-	return (
-		error instanceof Error &&
-		error.message.includes(
-			"This extension ctx is stale after session replacement or reload",
+	if (parsed.accounts !== undefined) {
+		if (
+			!parsed.accounts ||
+			typeof parsed.accounts !== "object" ||
+			Array.isArray(parsed.accounts)
 		)
-	);
+			throw new Error("Codex accounts must be an object.");
+		for (const [name, value] of Object.entries(parsed.accounts)) {
+			if (!parseAccountName(name).ok)
+				throw new Error("Invalid saved Codex account name.");
+			Object.defineProperty(accounts, name, {
+				value: normalizeCredential(value),
+				enumerable: true,
+				writable: true,
+				configurable: true,
+			});
+		}
+	}
+	return {
+		...(defaultName !== undefined ? { default: defaultName } : {}),
+		accounts,
+	};
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
+function stringifyStoredData(data: CodexAccountsData): string {
+	const normalized = parseStoredData(JSON.stringify(data));
+	// Older processes read ONLY `active` and discard `default` when writing.
+	// Mirror the global default on disk so both generations survive each
+	// other's refresh writes. This is never the session-selected account.
+	return `${JSON.stringify({ ...normalized, active: normalized.default }, null, 2)}\n`;
 }
-
-function hasErrorCode(error: unknown, code: string): boolean {
-	return error instanceof Error && "code" in error && error.code === code;
+function normalizeCredential(value: unknown): StoredCodexCredential {
+	const raw = value as Partial<StoredCodexCredential> | undefined;
+	if (
+		!raw ||
+		typeof raw.access !== "string" ||
+		!raw.access ||
+		typeof raw.refresh !== "string" ||
+		!raw.refresh ||
+		typeof raw.expires !== "number" ||
+		!Number.isFinite(raw.expires)
+	)
+		throw new Error(
+			"Invalid Codex credential fields; no credentials were changed.",
+		);
+	return {
+		access: raw.access,
+		refresh: raw.refresh,
+		expires: raw.expires,
+		...(typeof raw.accountId === "string" && raw.accountId
+			? { accountId: raw.accountId }
+			: {}),
+	};
 }
-
+function editDistance(left: string, right: string): number {
+	let row = Array.from({ length: right.length + 1 }, (_, index) => index);
+	for (let i = 1; i <= left.length; i++) {
+		const next = [i];
+		for (let j = 1; j <= right.length; j++)
+			next[j] = Math.min(
+				row[j] + 1,
+				next[j - 1] + 1,
+				row[j - 1] + Number(left[i - 1] !== right[j - 1]),
+			);
+		row = next;
+	}
+	return row[right.length];
+}
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
-
+function redactTokenText(text: string): string {
+	return text
+		.replace(/Bearer\s+[^\s]+/gi, "Bearer <redacted>")
+		.replace(/\beyJ[A-Za-z0-9._-]+/g, "<redacted>")
+		.replace(/\brt\.[A-Za-z0-9._-]+/g, "<redacted>");
+}
 function redactCredentialError(
 	error: unknown,
 	credential: StoredCodexCredential,
 ): string {
-	return redactTokenText(errorMessage(error), [
-		credential.access,
-		credential.refresh,
-	]);
+	let text = errorMessage(error);
+	for (const secret of [credential.access, credential.refresh])
+		text = text.split(secret).join("<redacted>");
+	return redactTokenText(text);
 }
-
-function redactTokenText(
-	text: string,
-	exactSecrets: readonly string[] = [],
-): string {
-	const secrets = [...new Set(exactSecrets.filter(Boolean))].sort(
-		(left, right) => right.length - left.length,
-	);
-	const exactSecretPattern =
-		secrets.length > 0
-			? new RegExp(secrets.map((secret) => escapeRegExp(secret)).join("|"), "g")
-			: undefined;
-	return (
-		exactSecretPattern ? text.replace(exactSecretPattern, "<redacted>") : text
-	)
-		.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>")
-		.replace(/"access"\s*:\s*"[^"]+"/gi, '"access":"<redacted>"')
-		.replace(/"refresh"\s*:\s*"[^"]+"/gi, '"refresh":"<redacted>"')
-		.replace(/\b(access|refresh)[_-][A-Za-z0-9._~+/=-]+/gi, "$1-<redacted>");
-}
-
-const escapeRegExp = (value: string): string =>
-	value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

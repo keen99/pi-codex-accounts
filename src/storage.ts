@@ -1,25 +1,20 @@
+import { randomUUID } from "node:crypto";
 import {
-	chmodSync,
 	closeSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	renameSync,
+	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 
-const PRIVATE_FILE_WRITE_OPTIONS = { encoding: "utf8", mode: 0o600 } as const;
-
-type StorageLockResult<T> = {
-	result: T;
-	next?: string;
-};
-
+type StorageLockResult<T> = { result: T; next?: string };
 export interface CodexAccountStorageBackend {
-	/** Lockless read of the raw file contents. Safe: never creates or removes lock entries. */
 	readRaw(): string | undefined;
-	/** Locked read-modify-write. The lock exists only for the duration of a real write. */
 	withLockAsync<T>(
 		mutator: (current: string | undefined) => Promise<StorageLockResult<T>>,
 	): Promise<T>;
@@ -30,71 +25,67 @@ export class FileCodexAccountStorageBackend
 {
 	constructor(private readonly filePath: string) {}
 
+	/** A missing file is an empty store. Reads never create files or locks. */
 	readRaw(): string | undefined {
-		this.ensureFileExists();
-		return readFileSync(this.filePath, "utf8");
+		try {
+			return readFileSync(this.filePath, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
 	}
 
 	async withLockAsync<T>(
 		mutator: (current: string | undefined) => Promise<StorageLockResult<T>>,
 	): Promise<T> {
-		this.ensureFileExists();
-		let release: (() => Promise<void>) | undefined;
-		let compromisedError: Error | undefined;
-		const throwIfCompromised = () => {
-			if (compromisedError) throw compromisedError;
-		};
-
-		try {
-			release = await lockfile.lock(this.filePath, {
+		mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
+		let compromised: Error | undefined;
+		// Bound acquisition, not the transaction. In-flight refresh MUST settle
+		// and persist before release; racing it against a timeout loses rotations.
+		const release = await lockfile
+			.lock(this.filePath, {
 				realpath: false,
-				retries: {
-					retries: 10,
-					factor: 2,
-					minTimeout: 100,
-					maxTimeout: 10_000,
-					randomize: true,
-				},
+				retries: { retries: 4, factor: 2, minTimeout: 25, maxTimeout: 200 },
 				stale: 30_000,
 				onCompromised: (error) => {
-					compromisedError = error;
+					compromised = error;
 				},
+			})
+			.catch((error: NodeJS.ErrnoException) => {
+				if (error.code === "ELOCKED")
+					throw new Error(
+						"Codex credentials are locked by another writer. Retry shortly; no credentials were changed.",
+					);
+				throw error;
 			});
-			throwIfCompromised();
-			const { result, next } = await mutator(
-				readFileSync(this.filePath, "utf8"),
-			);
-			throwIfCompromised();
-			if (next !== undefined) this.writePrivate(next);
-			throwIfCompromised();
+		try {
+			const current = this.readRaw();
+			const { result, next } = await mutator(current);
+			if (compromised) throw compromised;
+			if (next !== undefined && next !== current) this.writeAtomic(next);
 			return result;
 		} finally {
-			if (release) {
-				try {
-					await release();
-				} catch {
-					// A compromised lock may already have been removed by another process.
-				}
-			}
+			await release().catch(() => undefined);
 		}
 	}
 
-	private ensureFileExists(): void {
-		mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
+	private writeAtomic(contents: string): void {
+		const temporary = join(
+			dirname(this.filePath),
+			`.codex-accounts-${randomUUID()}.tmp`,
+		);
 		let descriptor: number | undefined;
 		try {
-			descriptor = openSync(this.filePath, "wx", 0o600);
-			writeFileSync(descriptor, "", PRIVATE_FILE_WRITE_OPTIONS);
-		} catch (error) {
-			if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+			descriptor = openSync(temporary, "wx", 0o600);
+			writeFileSync(descriptor, contents, "utf8");
+			fsyncSync(descriptor);
+			closeSync(descriptor);
+			descriptor = undefined;
+			renameSync(temporary, this.filePath);
 		} finally {
 			if (descriptor !== undefined) closeSync(descriptor);
+			rmSync(temporary, { force: true });
 		}
-	}
-
-	private writePrivate(contents: string): void {
-		writeFileSync(this.filePath, contents, PRIVATE_FILE_WRITE_OPTIONS);
-		chmodSync(this.filePath, 0o600);
 	}
 }
 
@@ -102,20 +93,19 @@ export class InMemoryCodexAccountStorageBackend
 	implements CodexAccountStorageBackend
 {
 	private value: string | undefined;
-
+	private tail: Promise<unknown> = Promise.resolve();
 	readRaw(): string | undefined {
 		return this.value;
 	}
-
-	async withLockAsync<T>(
+	withLockAsync<T>(
 		mutator: (current: string | undefined) => Promise<StorageLockResult<T>>,
 	): Promise<T> {
-		const { result, next } = await mutator(this.value);
-		if (next !== undefined) this.value = next;
-		return result;
+		const operation = this.tail.then(async () => {
+			const { result, next } = await mutator(this.value);
+			if (next !== undefined) this.value = next;
+			return result;
+		});
+		this.tail = operation.catch(() => undefined);
+		return operation;
 	}
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-	return error instanceof Error;
 }

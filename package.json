@@ -28,7 +28,9 @@
 		]
 	},
 	"scripts": {
-		"check": "biome check . && npm run typecheck",
+		"check": "npm run typecheck && npm test",
+		"test": "npx --yes tsx@4.20.6 --test test/*.test.ts",
+		"test:rpc": "node test/rpc-smoke.mjs",
 		"format": "biome check --write .",
 		"typecheck": "tsc --noEmit"
 	},
