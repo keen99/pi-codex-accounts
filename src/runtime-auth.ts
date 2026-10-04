@@ -49,6 +49,10 @@ export class RuntimeApiKeyBridge {
 	prepare(ctx: ExtensionContext, operationGeneration: number): void {
 		if (operationGeneration !== this.operationGeneration || this.registered)
 			return;
+		// Very old pi (0.75.x era) may not expose registerProvider at all;
+		// its authStorage override path never needed the bridge. Skip cleanly.
+		if (typeof (this.pi as { registerProvider?: unknown }).registerProvider !== "function")
+			return;
 		const current = this.getRegisteredProviderConfig(ctx);
 		this.previousProviderApiKey = current
 			? { present: Object.hasOwn(current, "apiKey"), value: current.apiKey }
