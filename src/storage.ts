@@ -47,7 +47,7 @@ export class FileCodexAccountStorageBackend
 				realpath: false,
 				retries: { retries: 4, factor: 2, minTimeout: 25, maxTimeout: 200 },
 				stale: 30_000,
-				onCompromised: (error) => {
+				onCompromised: (error: Error) => {
 					compromised = error;
 				},
 			})

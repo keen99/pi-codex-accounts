@@ -1,6 +1,19 @@
 # pi-codex-accounts
 
+![release-watch](https://github.com/keen99/pi-codex-accounts/actions/workflows/release-watch.yml/badge.svg)
+[![pi tested](https://img.shields.io/github/v/release/keen99/pi-codex-accounts?label=pi%20tested%200.75.0%20%E2%86%92)](https://github.com/keen99/pi-codex-accounts/releases)
+
 Named ChatGPT Codex credentials with independent account selection for each pi session. Fork of `@narumitw/pi-codex-accounts`; keeps `codex-accounts.json` and `accountId` for usage reporting.
+
+## Install
+
+```bash
+# ssh
+pi install git:git@github.com:keen99/pi-codex-accounts
+
+# https
+pi install git:github.com/keen99/pi-codex-accounts
+```
 
 ## Commands
 
@@ -69,6 +82,20 @@ The extension owns its PKCE callback server, matching pi's Codex client ID and e
 ## Usage footer contract
 
 `pi-usage-status` reads the same `codex-accounts/selection-v1` session entry and the new/legacy global-default schema. Changes emit `codex-accounts:changed-v1` on pi's shared event bus. The previously shipped optional global refresh hook remains for backward compatibility. No file watcher or shared session map is needed.
+
+## Development
+
+```sh
+npm run check       # typecheck + 26 unit tests (oauth, storage, switching, refresh)
+npm run test:matrix # deep RPC smoke on every published pi release >= 0.75.0
+```
+
+The matrix boots each pinned pi release in RPC mode and drives the full
+smoke: load, account switch, auth, footer, reload, Escape cancellation,
+credential preservation. Cached installs live in `.matrix-cache/` and
+are reused across runs; new pi releases are picked up automatically.
+
+`PI_TEST_BIN` overrides the pi binary in the smoke test.
 
 ## Development tests
 
