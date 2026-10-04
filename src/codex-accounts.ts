@@ -11,7 +11,7 @@ import {
 	type OAuthCredentials,
 	type RefreshOnlyCodexOAuthProvider,
 } from "./oauth.js";
-import { RuntimeApiKeyController } from "./runtime-auth.js";
+import { RuntimeApiKeyBridge, RuntimeApiKeyController } from "./runtime-auth.js";
 import {
 	ACCOUNT_CHANGED_EVENT,
 	ACCOUNT_STATE_TYPE,
@@ -106,11 +106,22 @@ export async function ensureActiveCodexAuth(
 		accountName?: string | null;
 		allowRefresh?: boolean;
 		isCurrent?: () => boolean;
+		prepareRuntimeApiKey?: () => void | Promise<void>;
 	} = {},
 ): Promise<EnsureActiveCodexAuthResult> {
 	const oauth =
 		options.oauthProvider ?? getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
 	const snapshot = runtime.capture(ctx);
+	// Register the provider api-key config BEFORE any auth resolution. Pi
+	// 0.80.5+/1.x resolve a stored api-key override only when the provider has
+	// an api-key auth resolver; the bridge supplies one. Older pi ignores the
+	// extra config (its authStorage override wins first), so this is safe both ways.
+	try {
+		await options.prepareRuntimeApiKey?.();
+	} catch {
+		// Unregistered bridge: on new pi the apply-verification below fails
+		// closed with a clear message; older pi never needed the bridge.
+	}
 	const currentOperation = options.isCurrent ?? (() => true);
 	let name = options.accountName;
 	let lastError = "Credentials changed repeatedly; retry the account switch.";
@@ -225,6 +236,28 @@ export default function codexAccounts(
 	const oauth =
 		dependencies.oauthProvider ??
 		getDefaultCodexOAuthProvider(CODEX_PROVIDER_ID);
+	const runtimeApiKeyBridge = new RuntimeApiKeyBridge(
+		pi,
+		CODEX_PROVIDER_ID,
+		FAIL_CLOSED_API_KEY,
+	);
+	// Pi 0.80.5+ resolves the session's default model at startup, BEFORE
+	// session_start, and skips providers without configured auth — the runtime
+	// key only lands later. Register the fail-closed api-key config at load so
+	// the Codex default wins model resolution; real credentials still flow
+	// through the runtime override per turn. Older pi ignores the extra
+	// config (its authStorage override wins first). Feature-detected.
+	if (
+		typeof (pi as { registerProvider?: unknown }).registerProvider === "function"
+	) {
+		try {
+			pi.registerProvider(CODEX_PROVIDER_ID, {
+				apiKey: FAIL_CLOSED_API_KEY,
+			} as Parameters<ExtensionAPI["registerProvider"]>[1]);
+		} catch {
+			// Registration is an optimization; runtime auth does not depend on it.
+		}
+	}
 	let selection: AccountSelection | undefined;
 	let generation = 0;
 	let stopped = false;
@@ -261,12 +294,17 @@ export default function codexAccounts(
 		model = ctx.model,
 	) {
 		const operation = generation;
+		const bridgeOperation = runtimeApiKeyBridge.beginOperation();
 		const result = await ensureActiveCodexAuth(ctx, store, {
 			oauthProvider: oauth,
 			accountName: selection?.accountName,
 			allowRefresh,
 			isCurrent: () => !stopped && operation === generation,
+			prepareRuntimeApiKey: () =>
+				runtimeApiKeyBridge.prepare(ctx, bridgeOperation),
 		});
+		if (result.status === "inactive")
+			runtimeApiKeyBridge.remove(ctx, bridgeOperation);
 		if (stopped || operation !== generation) return result;
 		const nextIdentity =
 			result.status === "inactive"
@@ -490,6 +528,7 @@ export default function codexAccounts(
 			saveSelection(store.read().default ?? null, ctx);
 		} else generation++;
 		await sync(ctx);
+		await selectDefaultCodexModelIfUnresolved(pi, ctx, selection?.accountName);
 		publish(ctx);
 	}
 	function eventGuard(fn: (ctx: ExtensionContext) => Promise<void>) {
@@ -562,7 +601,9 @@ export default function codexAccounts(
 		stopped = true;
 		generation++;
 		loginAbort?.abort();
+		const bridgeOperation = runtimeApiKeyBridge.beginOperation();
 		await runtime.clear(ctx);
+		runtimeApiKeyBridge.remove(ctx, bridgeOperation);
 		ctx.ui.setStatus(CODEX_ACCOUNTS_STATUS_KEY, undefined);
 	});
 }
@@ -663,6 +704,38 @@ export function isOpenAICodexModel(
 	model: { provider?: string } | undefined,
 ): boolean {
 	return model?.provider === CODEX_PROVIDER_ID;
+}
+/** Pi 0.80.5+ leaves the session model an unknown placeholder when no provider
+ * has configured auth at startup; our runtime key lands only after session_start.
+ * Once auth is applied, explicitly select the Codex model so status and turn
+ * gating work. Older pi resolves the model itself — nothing to do there. */
+function isUnknownModel(
+	model: { provider?: string; id?: string } | undefined,
+): boolean {
+	return model?.provider === "unknown" && model.id === "unknown";
+}
+async function selectDefaultCodexModelIfUnresolved(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	accountName: string | null | undefined,
+): Promise<void> {
+	if (!isUnknownModel(ctx.model)) return;
+	if (accountName == null) return; // builtin/none: pi resolves its own login's model
+	const registry = ctx.modelRegistry as unknown as {
+		find?: (provider: string, modelId: string) => unknown;
+	};
+	const setModel = (pi as unknown as {
+		setModel?: (model: unknown) => boolean | Promise<boolean>;
+	}).setModel;
+	if (typeof registry.find !== "function" || typeof setModel !== "function")
+		return;
+	const model = registry.find(CODEX_PROVIDER_ID, DEFAULT_CODEX_MODEL_ID);
+	if (!model) return;
+	try {
+		await setModel.call(pi, model);
+	} catch {
+		// Model selection is cosmetic here; auth is already applied.
+	}
 }
 function isBuiltinArg(value: string): boolean {
 	return value === "builtin" || value === DEFAULT_PI_LOGIN_LABEL;
