@@ -17,7 +17,7 @@ const child = spawn(process.env.PI_TEST_BIN ?? join(dirname(process.execPath), '
   '-e', join(repo, 'src/codex-accounts.ts'),
   '-e', resolve(repo, '../pi-usage-status/src/index.ts'),
   '-e', join(repo, 'test/rpc-controls.ts'),
-], { cwd: sandbox, env: { ...process.env, PI_CODING_AGENT_DIR: sandbox }, stdio: ['pipe', 'pipe', 'pipe'] });
+], { cwd: sandbox, env: { ...process.env, PI_CODING_AGENT_DIR: sandbox }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
 const pending = new Map();
 const events = [];
 let nextId = 0, buffer = '', errors = '';
@@ -99,6 +99,17 @@ try {
   // Graceful shutdown of this test-owned process only. Never signal user sessions.
   await request('prompt', { message: '/test-quit' }).catch(() => undefined);
   child.stdin.end();
-  await new Promise(resolve => child.once('close', resolve));
+  // Bounded close wait. On runners the pi process tree (refresh worker etc.)
+  // can hold the stdio pipes open, so 'close' never fires and node exits with
+  // code 13 (unsettled top-level await) — which masked every real failure.
+  // detached:true makes the child a process group leader, so the fallback
+  // kills the whole tree.
+  await new Promise((resolve) => {
+    const killer = setTimeout(() => {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+      resolve();
+    }, 5000);
+    child.once('close', () => { clearTimeout(killer); resolve(); });
+  });
   rmSync(sandbox, { recursive: true, force: true });
 }
