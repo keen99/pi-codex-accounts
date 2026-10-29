@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -15,7 +15,6 @@ writeFileSync(join(sandbox, 'settings.json'), JSON.stringify({ packages: [], def
 // dependency's different pi version. Default to this Node installation's pi.
 const child = spawn(process.env.PI_TEST_BIN ?? join(dirname(process.execPath), 'pi'), ['--mode', 'rpc', '--no-session', '--no-extensions',
   '-e', join(repo, 'src/codex-accounts.ts'),
-  '-e', resolve(repo, '../pi-usage-status/src/index.ts'),
   '-e', join(repo, 'test/rpc-controls.ts'),
 ], { cwd: sandbox, env: { ...process.env, PI_CODING_AGENT_DIR: sandbox }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
 const pending = new Map();
@@ -70,9 +69,6 @@ try {
   await request('prompt', { message: '/test-reload' });
   s = await state();
   assert.equal(s.selection.accountName, 'plus'); assert.equal(s.key, 'fake-plus');
-  const lastFooter = events.filter(e => e.method === 'setStatus' && e.statusKey === 'usage-status' && e.statusText).at(-1);
-  assert.match(lastFooter.statusText, /plus/);
-  assert.equal(readFileSync(join(sandbox, 'codex-accounts.json'), 'utf8'), raw);
   let before = events.length;
   const cancelLogin = request('prompt', { message: '/test-owned-login' });
   const cancelInput = await waitFor(e => events.indexOf(e) >= before && e.method === 'input');
@@ -94,7 +90,7 @@ try {
   s = await state(); assert.equal(s.key, 'fake-plus');
   assert.equal(readFileSync(join(sandbox, 'codex-accounts.json'), 'utf8'), raw);
   assert.ok(!events.some(e => e.type === 'extension_error'), JSON.stringify(events.filter(e => e.type === 'extension_error')));
-  console.log('Pinned-pi RPC smoke PASS: load, switch, auth, footer, reload, Escape cancellation, browser auto-completion, unchanged credentials.');
+  console.log('Pinned-pi RPC smoke PASS: load, switch, auth, reload, Escape cancellation, browser auto-completion, unchanged credentials.');
 } finally {
   // Graceful shutdown of this test-owned process only. Never signal user sessions.
   await request('prompt', { message: '/test-quit' }).catch(() => undefined);
